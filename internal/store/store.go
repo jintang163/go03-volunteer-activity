@@ -86,7 +86,11 @@ type Store interface {
 	GetFeedback(ctx context.Context, activityID, volunteerID string) (model.Feedback, error)
 	ListFeedbackByActivity(ctx context.Context, activityID string) ([]model.Feedback, error)
 
-	ApplyHoursAndPoints(ctx context.Context, hour model.HourRecord, user model.User, hl model.HourLedger, pl model.PointLedger) (model.HourRecord, model.User, error)
+	// ApplyHourApproval 在单次写锁内原子地完成「校验工时仍在待审 + 入账工时与积分 +
+	// 写两条流水」。它把 Approve 此前「先 GetHour 检查状态、后入账」两步间留下的
+	// TOCTOU 竞态消除：并发审批都通过状态检查后，第二个进入锁内时看到工时已是
+	// approved，即返回 ErrHoursNotPending，从而保证同一条工时只能成功入账一次。
+	ApplyHourApproval(ctx context.Context, hour model.HourRecord, hl model.HourLedger, pl model.PointLedger) (model.HourRecord, model.User, error)
 	ApplyPoints(ctx context.Context, user model.User, pl model.PointLedger) (model.User, error)
 	RecountActivityCounters(ctx context.Context, activityID string) (model.Activity, error)
 }
