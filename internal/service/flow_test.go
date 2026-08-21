@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -9,6 +11,22 @@ import (
 	"go03-volunteer-activity/internal/model"
 	"go03-volunteer-activity/internal/store"
 )
+
+type capacityBarrierStore struct {
+	store.Store
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (s *capacityBarrierStore) CountApprovedByActivity(ctx context.Context, activityID string) (int, error) {
+	count, err := s.Store.CountApprovedByActivity(ctx, activityID)
+	if err != nil {
+		return 0, err
+	}
+	s.ready <- struct{}{}
+	<-s.release
+	return count, nil
+}
 
 type fakeClock struct{ t time.Time }
 
@@ -80,6 +98,74 @@ func TestSignupWaitlistAndApprove(t *testing.T) {
 	}
 	if got.Status != model.SignupApproved {
 		t.Fatalf("promoted=%s", got.Status)
+	}
+}
+
+func TestConcurrentSignupRespectsCapacity(t *testing.T) {
+	now := time.Date(2026, 8, 21, 8, 0, 0, 0, time.UTC)
+	base := store.NewMemoryStore(nil, nil)
+	barrier := &capacityBarrierStore{
+		Store:   base,
+		ready:   make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	hasher := auth.NewPasswordHasher()
+	svc := NewServices(barrier, hasher, auth.NewSessionManager(time.Hour), fakeClock{t: now}, 3)
+	ctx := context.Background()
+	org := mustUser(t, base, hasher, "capacity-org", "org123x", model.RoleOrganizer)
+	v1 := mustUser(t, base, hasher, "capacity-v1", "pass123", model.RoleVolunteer)
+	v2 := mustUser(t, base, hasher, "capacity-v2", "pass123", model.RoleVolunteer)
+	act, err := svc.Activity.Create(ctx, org, model.CreateActivityRequest{
+		Title: "并发报名活动", Content: "验证活动满员时不会发生超额录取的业务场景", Category: model.CatCommunity,
+		Location: "社区中心", ContactName: "org", Capacity: 1, WaitlistEnabled: false,
+		SignupOpenAt: now.Add(-time.Hour), SignupCloseAt: now.Add(time.Hour),
+		StartAt: now.Add(2 * time.Hour), EndAt: now.Add(4 * time.Hour), PlannedMinutes: 120, Publish: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		signup model.Signup
+		err    error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for _, volunteer := range []model.User{v1, v2} {
+		wg.Add(1)
+		go func(actor model.User) {
+			defer wg.Done()
+			signup, signupErr := svc.Signup.Signup(ctx, actor, act.ID, model.SignupRequest{})
+			results <- result{signup: signup, err: signupErr}
+		}(volunteer)
+	}
+
+	<-barrier.ready
+	<-barrier.ready
+	close(barrier.release)
+	wg.Wait()
+	close(results)
+
+	approved, full := 0, 0
+	for result := range results {
+		switch {
+		case result.err == nil && result.signup.Status == model.SignupApproved:
+			approved++
+		case errors.Is(result.err, model.ErrCapacityFull):
+			full++
+		default:
+			t.Fatalf("unexpected signup result: signup=%+v err=%v", result.signup, result.err)
+		}
+	}
+	if approved != 1 || full != 1 {
+		t.Fatalf("capacity=1 concurrent results: approved=%d capacity_full=%d; want approved=1 capacity_full=1", approved, full)
+	}
+	stored, err := base.ListSignupsByActivity(ctx, act.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 || stored[0].Status != model.SignupApproved {
+		t.Fatalf("stored signups=%+v; want exactly one approved signup", stored)
 	}
 }
 
