@@ -80,6 +80,18 @@ type noShowBarrierStore struct {
 	release chan struct{}
 }
 
+type certificateBarrierStore struct {
+	store.Store
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (s *certificateBarrierStore) CreateCertificate(ctx context.Context, certificate model.Certificate) (model.Certificate, error) {
+	s.ready <- struct{}{}
+	<-s.release
+	return s.Store.CreateCertificate(ctx, certificate)
+}
+
 func (s *noShowBarrierStore) ReserveActivityCompletion(ctx context.Context, activity model.Activity) (model.Activity, error) {
 	s.ready <- struct{}{}
 	<-s.release
@@ -864,5 +876,48 @@ func TestConcurrentActivityCompletionMarksNoShowOnce(t *testing.T) {
 	}
 	if succeeded != 1 || invalid != 1 || len(ledgers) != 1 {
 		t.Fatalf("concurrent completion: succeeded=%d invalid_status=%d point_ledgers=%d; want 1,1,1", succeeded, invalid, len(ledgers))
+	}
+}
+
+func TestConcurrentCertificateIssueCreatesSingleTier(t *testing.T) {
+	now := time.Date(2026, 8, 21, 8, 0, 0, 0, time.UTC)
+	base := store.NewMemoryStore(nil, nil)
+	hasher := auth.NewPasswordHasher()
+	actor := mustUser(t, base, hasher, "cert-admin", "admin123", model.RoleAdmin)
+	vol := mustUser(t, base, hasher, "cert-vol", "pass123", model.RoleVolunteer)
+	vol.TotalMinutes = 20 * 60
+	vol, err := base.UpdateUser(context.Background(), vol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &certificateBarrierStore{Store: base, ready: make(chan struct{}, 2), release: make(chan struct{})}
+	svc := NewServices(barrier, hasher, auth.NewSessionManager(time.Hour), fakeClock{t: now}, 3)
+	ctx := context.Background()
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); errs <- svc.Cert.MaybeIssue(ctx, actor, vol) }()
+	}
+	<-barrier.ready
+	<-barrier.ready
+	close(barrier.release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("unexpected certificate issue error: %v", err)
+		}
+	}
+	certs, err := base.ListCertificatesByUser(ctx, vol.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifications, err := base.ListNotifications(ctx, vol.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(certs) != 1 || len(notifications) != 1 {
+		t.Fatalf("concurrent certificate issue: certificates=%d notifications=%d; want 1,1", len(certs), len(notifications))
 	}
 }
