@@ -40,6 +40,18 @@ type feedbackBarrierStore struct {
 	release chan struct{}
 }
 
+type teamMemberBarrierStore struct {
+	store.Store
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (s *teamMemberBarrierStore) CreateTeamMember(ctx context.Context, member model.TeamMember) (model.TeamMember, error) {
+	s.ready <- struct{}{}
+	<-s.release
+	return s.Store.CreateTeamMember(ctx, member)
+}
+
 func (s *feedbackBarrierStore) ReserveFeedback(ctx context.Context, feedback model.Feedback) (model.Feedback, error) {
 	s.ready <- struct{}{}
 	<-s.release
@@ -496,5 +508,68 @@ func TestConcurrentFeedbackCreatesSingleSubmission(t *testing.T) {
 	}
 	if succeeded != 1 || duplicate != 1 || len(stored) != 1 {
 		t.Fatalf("concurrent feedback result: succeeded=%d already_feedback=%d stored=%d; want 1,1,1", succeeded, duplicate, len(stored))
+	}
+}
+
+func TestConcurrentTeamInviteCreatesSingleMembership(t *testing.T) {
+	now := time.Date(2026, 8, 21, 15, 0, 0, 0, time.UTC)
+	base := store.NewMemoryStore(nil, nil)
+	hasher := auth.NewPasswordHasher()
+	ctx := context.Background()
+	owner := mustUser(t, base, hasher, "team-owner", "org123x", model.RoleOrganizer)
+	member := mustUser(t, base, hasher, "team-member", "pass123", model.RoleVolunteer)
+	team, err := base.CreateTeam(ctx, model.Team{OwnerID: owner.ID, Name: "并发邀请团队", CreatedAt: now, UpdatedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base.CreateTeamMember(ctx, model.TeamMember{TeamID: team.ID, UserID: owner.ID, Role: "owner", JoinedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	barrier := &teamMemberBarrierStore{Store: base, ready: make(chan struct{}, 2), release: make(chan struct{})}
+	svc := NewServices(barrier, hasher, auth.NewSessionManager(time.Hour), fakeClock{t: now}, 3)
+
+	type result struct {
+		member model.TeamMember
+		err    error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			created, inviteErr := svc.Team.Invite(ctx, owner, team.ID, member.Username)
+			results <- result{member: created, err: inviteErr}
+		}()
+	}
+	<-barrier.ready
+	<-barrier.ready
+	close(barrier.release)
+	wg.Wait()
+	close(results)
+
+	succeeded, duplicate := 0, 0
+	for result := range results {
+		switch {
+		case result.err == nil && result.member.ID != "":
+			succeeded++
+		case errors.Is(result.err, model.ErrAlreadyTeamMember):
+			duplicate++
+		default:
+			t.Fatalf("unexpected invite result: member=%+v err=%v", result.member, result.err)
+		}
+	}
+	members, err := base.ListTeamMembers(ctx, team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetCount := 0
+	for _, stored := range members {
+		if stored.UserID == member.ID {
+			targetCount++
+		}
+	}
+	if succeeded != 1 || duplicate != 1 || targetCount != 1 {
+		t.Fatalf("concurrent invite result: succeeded=%d already_member=%d target_memberships=%d; want 1,1,1", succeeded, duplicate, targetCount)
 	}
 }
