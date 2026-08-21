@@ -26,6 +26,18 @@ type hoursApprovalBarrierStore struct {
 	release chan struct{}
 }
 
+type checkInBarrierStore struct {
+	store.Store
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (s *checkInBarrierStore) CreateCheckIn(ctx context.Context, checkIn model.CheckIn) (model.CheckIn, error) {
+	s.ready <- struct{}{}
+	<-s.release
+	return s.Store.CreateCheckIn(ctx, checkIn)
+}
+
 func (s *hoursApprovalBarrierStore) ApplyHourApproval(ctx context.Context, hour model.HourRecord, hl model.HourLedger, pl model.PointLedger) (model.HourRecord, model.User, error) {
 	s.ready <- struct{}{}
 	<-s.release
@@ -343,5 +355,68 @@ func TestConcurrentHoursApprovalIsIdempotent(t *testing.T) {
 	}
 	if approved != 1 || notPending != 1 || user.TotalMinutes != 60 || user.Points != 10 || len(hourLedgers) != 1 || len(pointLedgers) != 1 {
 		t.Fatalf("concurrent approval result: approved=%d not_pending=%d minutes=%d points=%d hour_ledgers=%d point_ledgers=%d; want 1,1,60,10,1,1", approved, notPending, user.TotalMinutes, user.Points, len(hourLedgers), len(pointLedgers))
+	}
+}
+
+func TestConcurrentSelfCheckInCreatesSingleRecord(t *testing.T) {
+	now := time.Date(2026, 8, 21, 10, 0, 0, 0, time.UTC)
+	base := store.NewMemoryStore(nil, nil)
+	barrier := &checkInBarrierStore{Store: base, ready: make(chan struct{}, 2), release: make(chan struct{})}
+	hasher := auth.NewPasswordHasher()
+	svc := NewServices(barrier, hasher, auth.NewSessionManager(time.Hour), fakeClock{t: now}, 3)
+	ctx := context.Background()
+	org := mustUser(t, base, hasher, "checkin-org", "org123x", model.RoleOrganizer)
+	vol := mustUser(t, base, hasher, "checkin-vol", "pass123", model.RoleVolunteer)
+	act, err := svc.Activity.Create(ctx, org, model.CreateActivityRequest{
+		Title: "并发签到活动", Content: "验证同一志愿者不会在同一活动产生重复签到记录", Category: model.CatCommunity,
+		Location: "签到点", ContactName: "org", Capacity: 5,
+		SignupOpenAt: now.Add(-2 * time.Hour), SignupCloseAt: now.Add(time.Hour),
+		StartAt: now, EndAt: now.Add(2 * time.Hour), PlannedMinutes: 120, Publish: true,
+		CheckInOpenBefore: 30, CheckOutGrace: 60,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Signup.Signup(ctx, vol, act.ID, model.SignupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		checkIn model.CheckIn
+		err     error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			record, checkInErr := svc.CheckIn.SelfCheckIn(ctx, vol, act.ID, model.CheckInRequest{Code: act.CheckInCode})
+			results <- result{checkIn: record, err: checkInErr}
+		}()
+	}
+	<-barrier.ready
+	<-barrier.ready
+	close(barrier.release)
+	wg.Wait()
+	close(results)
+
+	succeeded, duplicate := 0, 0
+	for result := range results {
+		switch {
+		case result.err == nil && result.checkIn.ID != "":
+			succeeded++
+		case errors.Is(result.err, model.ErrAlreadyCheckedIn):
+			duplicate++
+		default:
+			t.Fatalf("unexpected check-in result: record=%+v err=%v", result.checkIn, result.err)
+		}
+	}
+	stored, err := base.ListCheckInsByActivity(ctx, act.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if succeeded != 1 || duplicate != 1 || len(stored) != 1 {
+		t.Fatalf("concurrent check-in result: succeeded=%d already_checked_in=%d stored=%d; want 1,1,1", succeeded, duplicate, len(stored))
 	}
 }
