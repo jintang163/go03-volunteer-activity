@@ -273,6 +273,30 @@ func (m *MemoryStore) HasCertificateTier(_ context.Context, userID string, tier 
 	return false, nil
 }
 
+// ReserveCertificate 在单次写锁内原子地完成「检查同一用户同一档位是否已发证 + 写入证书」。
+// 它消除 MaybeIssue 此前「先 HasCertificateTier 检查、后 CreateCertificate 写入」两步之间的
+// TOCTOU 竞态：志愿者刚达到某档位门槛时，两个并发发证请求都通过存在性检查后，第二个进入
+// 写锁时重新读到已写入的同档位证书，即返回 ErrAlreadyCertTier，从而保证同一用户在同一档位
+// 只能生成一张证书，重复请求不再产生额外的审计与通知。
+func (m *MemoryStore) ReserveCertificate(_ context.Context, c model.Certificate) (model.Certificate, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, ex := range m.certificates {
+		if ex.UserID == c.UserID && ex.Tier == c.Tier {
+			return model.Certificate{}, model.ErrAlreadyCertTier
+		}
+	}
+	if c.ID == "" {
+		c.ID = m.idGen(model.CertIDPrefix)
+	}
+	if c.Code == "" {
+		c.Code = "VA-" + m.codeGen(10)
+	}
+	m.certificates[c.ID] = c
+	m.persist()
+	return c, nil
+}
+
 func (m *MemoryStore) CreateFeedback(_ context.Context, f model.Feedback) (model.Feedback, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -80,16 +80,18 @@ type noShowBarrierStore struct {
 	release chan struct{}
 }
 
+// certificateBarrierStore 在 ReserveCertificate（修复后的原子写入点）上设置同步屏障，
+// 让并发发证请求都抵达决策临界区后再同时放行，最大化竞态窗口以稳定复现重复发证与重复通知。
 type certificateBarrierStore struct {
 	store.Store
 	ready   chan struct{}
 	release chan struct{}
 }
 
-func (s *certificateBarrierStore) CreateCertificate(ctx context.Context, certificate model.Certificate) (model.Certificate, error) {
+func (s *certificateBarrierStore) ReserveCertificate(ctx context.Context, certificate model.Certificate) (model.Certificate, error) {
 	s.ready <- struct{}{}
 	<-s.release
-	return s.Store.CreateCertificate(ctx, certificate)
+	return s.Store.ReserveCertificate(ctx, certificate)
 }
 
 func (s *noShowBarrierStore) ReserveActivityCompletion(ctx context.Context, activity model.Activity) (model.Activity, error) {
@@ -904,8 +906,14 @@ func TestConcurrentCertificateIssueCreatesSingleTier(t *testing.T) {
 	close(barrier.release)
 	wg.Wait()
 	close(errs)
+	succeeded, duplicate := 0, 0
 	for err := range errs {
-		if err != nil {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, model.ErrAlreadyCertTier):
+			duplicate++
+		default:
 			t.Fatalf("unexpected certificate issue error: %v", err)
 		}
 	}
@@ -917,7 +925,13 @@ func TestConcurrentCertificateIssueCreatesSingleTier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(certs) != 1 || len(notifications) != 1 {
-		t.Fatalf("concurrent certificate issue: certificates=%d notifications=%d; want 1,1", len(certs), len(notifications))
+	audits, err := base.ListAudits(ctx, "certificate", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 只有一个请求胜出发证，第二个在锁内重新读到同档位证书即返回 ErrAlreadyCertTier，
+	// 因此证书、通知与审计都只随胜出请求各产生一份，重复请求不再产生额外副作用。
+	if succeeded != 1 || duplicate != 1 || len(certs) != 1 || len(notifications) != 1 || len(audits) != 1 {
+		t.Fatalf("concurrent certificate issue: succeeded=%d already_cert=%d certificates=%d notifications=%d audits=%d; want 1,1,1,1,1", succeeded, duplicate, len(certs), len(notifications), len(audits))
 	}
 }

@@ -180,11 +180,13 @@ func (s *CertService) MaybeIssue(ctx context.Context, actor model.User, voluntee
 	default:
 		return nil
 	}
-	ok, err := s.store.HasCertificateTier(ctx, volunteer.ID, tier)
-	if err != nil || ok {
-		return err
-	}
-	c, err := s.store.CreateCertificate(ctx, model.Certificate{
+	// 原子地完成「检查同档位是否已发证 + 写入证书」。此前采用先 HasCertificateTier 检查、
+	// 后 CreateCertificate 写入的两步式流程，两次加锁之间存在 TOCTOU 竞态：志愿者刚达到某
+	// 档位门槛时，两个并发发证请求都能通过存在性检查而各自写入，最终生成两张同档位证书并
+	// 发送两条通知。现把检查与写入下沉到 store.ReserveCertificate 的单次写锁内，第二个请求
+	// 在锁内重新读到已存在的同档位证书即返回 ErrAlreadyCertTier，保证同一用户同一档位只能
+	// 生成一张证书，重复请求不再产生额外审计与通知。
+	c, err := s.store.ReserveCertificate(ctx, model.Certificate{
 		UserID:       volunteer.ID,
 		Tier:         tier,
 		HoursAtIssue: mins / 60,

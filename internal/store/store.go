@@ -115,6 +115,12 @@ type Store interface {
 	GetCertificateByCode(ctx context.Context, code string) (model.Certificate, error)
 	ListCertificatesByUser(ctx context.Context, userID string) ([]model.Certificate, error)
 	HasCertificateTier(ctx context.Context, userID string, tier model.CertificateTier) (bool, error)
+	// ReserveCertificate 在单次写锁内原子地完成「检查同一用户同一档位是否已发证 + 写入证书」，
+	// 消除 MaybeIssue 此前「先 HasCertificateTier 检查、后 CreateCertificate 写入」之间的
+	// TOCTOU 竞态：志愿者刚达到某档位门槛时，两个并发发证请求都通过存在性检查后，第二个进入
+	// 写锁时重新读到已写入的同档位证书，即返回 ErrAlreadyCertTier，从而保证同一用户在同一档位
+	// 只能生成一张证书，重复请求不再产生额外的审计与通知。
+	ReserveCertificate(ctx context.Context, c model.Certificate) (model.Certificate, error)
 
 	CreateFeedback(ctx context.Context, f model.Feedback) (model.Feedback, error)
 	GetFeedback(ctx context.Context, activityID, volunteerID string) (model.Feedback, error)

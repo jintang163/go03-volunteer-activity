@@ -59,6 +59,7 @@ var (
 	ErrNoCheckoutForAutoHours = errors.New("cannot auto-calculate hours without check-out")
 	ErrAlreadyFeedback        = errors.New("already submitted feedback")
 	ErrActivityNotCompleted   = errors.New("activity is not completed")
+	ErrAlreadyCertTier        = errors.New("certificate tier already issued")
 	ErrNotTeamOwner           = errors.New("only the team owner can perform this action")
 	ErrAlreadyTeamMember      = errors.New("already a team member")
 	ErrNotTeamMember          = errors.New("not a team member")
@@ -110,6 +111,7 @@ func IsConflict(err error) bool {
 		errors.Is(err, ErrNoCheckoutForAutoHours) ||
 		errors.Is(err, ErrAlreadyFeedback) ||
 		errors.Is(err, ErrActivityNotCompleted) ||
+		errors.Is(err, ErrAlreadyCertTier) ||
 		errors.Is(err, ErrAlreadyTeamMember) ||
 		errors.Is(err, ErrNotTeamMember)
 }
