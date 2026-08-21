@@ -20,6 +20,18 @@ type capacityBarrierStore struct {
 	release chan struct{}
 }
 
+type hoursApprovalBarrierStore struct {
+	store.Store
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (s *hoursApprovalBarrierStore) ApplyHoursAndPoints(ctx context.Context, hour model.HourRecord, user model.User, hl model.HourLedger, pl model.PointLedger) (model.HourRecord, model.User, error) {
+	s.ready <- struct{}{}
+	<-s.release
+	return s.Store.ApplyHoursAndPoints(ctx, hour, user, hl, pl)
+}
+
 func (s *capacityBarrierStore) ReserveSignup(ctx context.Context, sg model.Signup, act model.Activity) (model.Signup, error) {
 	s.ready <- struct{}{}
 	<-s.release
@@ -251,5 +263,85 @@ func TestHoursApproveAddsPoints(t *testing.T) {
 	}
 	if u.Points != 10 {
 		t.Fatalf("points=%d", u.Points)
+	}
+}
+
+func TestConcurrentHoursApprovalIsIdempotent(t *testing.T) {
+	now := time.Date(2026, 8, 21, 10, 0, 0, 0, time.UTC)
+	base := store.NewMemoryStore(nil, nil)
+	barrier := &hoursApprovalBarrierStore{
+		Store:   base,
+		ready:   make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	hasher := auth.NewPasswordHasher()
+	svc := NewServices(barrier, hasher, auth.NewSessionManager(time.Hour), fakeClock{t: now}, 3)
+	ctx := context.Background()
+	org := mustUser(t, base, hasher, "hours-org", "org123x", model.RoleOrganizer)
+	vol := mustUser(t, base, hasher, "hours-vol", "pass123", model.RoleVolunteer)
+	act, err := svc.Activity.Create(ctx, org, model.CreateActivityRequest{
+		Title: "并发工时审批活动", Content: "验证同一工时记录不会被重复审批和重复入账", Category: model.CatCommunity,
+		Location: "服务站", ContactName: "org", Capacity: 5,
+		SignupOpenAt: now.Add(-time.Hour), SignupCloseAt: now.Add(time.Hour),
+		StartAt: now, EndAt: now.Add(2 * time.Hour), PlannedMinutes: 120, Publish: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Signup.Signup(ctx, vol, act.ID, model.SignupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	hour, err := svc.Hours.SubmitManual(ctx, org, model.SubmitHoursRequest{
+		ActivityID: act.ID, VolunteerID: vol.ID, WorkMinutes: 60,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		hour model.HourRecord
+		err  error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			approved, approveErr := svc.Hours.Approve(ctx, org, hour.ID, model.ReviewHoursRequest{})
+			results <- result{hour: approved, err: approveErr}
+		}()
+	}
+	<-barrier.ready
+	<-barrier.ready
+	close(barrier.release)
+	wg.Wait()
+	close(results)
+
+	approved, notPending := 0, 0
+	for result := range results {
+		switch {
+		case result.err == nil && result.hour.Status == model.HourApproved:
+			approved++
+		case errors.Is(result.err, model.ErrHoursNotPending):
+			notPending++
+		default:
+			t.Fatalf("unexpected approval result: hour=%+v err=%v", result.hour, result.err)
+		}
+	}
+	user, err := base.GetUserByID(ctx, vol.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hourLedgers, err := base.ListHourLedgers(ctx, vol.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pointLedgers, err := base.ListPointLedgers(ctx, vol.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approved != 1 || notPending != 1 || user.TotalMinutes != 60 || user.Points != 10 || len(hourLedgers) != 1 || len(pointLedgers) != 1 {
+		t.Fatalf("concurrent approval result: approved=%d not_pending=%d minutes=%d points=%d hour_ledgers=%d point_ledgers=%d; want 1,1,60,10,1,1", approved, notPending, user.TotalMinutes, user.Points, len(hourLedgers), len(pointLedgers))
 	}
 }
