@@ -56,6 +56,20 @@ type checkOutBarrierStore struct {
 	release chan struct{}
 }
 
+type signupApprovalBarrierStore struct {
+	store.Store
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (s *signupApprovalBarrierStore) UpdateSignup(ctx context.Context, signup model.Signup) (model.Signup, error) {
+	if signup.Status == model.SignupApproved {
+		s.ready <- struct{}{}
+		<-s.release
+	}
+	return s.Store.UpdateSignup(ctx, signup)
+}
+
 func (s *checkOutBarrierStore) ReserveCheckOut(ctx context.Context, checkIn model.CheckIn) (model.CheckIn, error) {
 	s.ready <- struct{}{}
 	<-s.release
@@ -664,5 +678,68 @@ func TestConcurrentCheckOutTransitionsOnce(t *testing.T) {
 	}
 	if len(hourLedgers) != 0 {
 		t.Fatalf("concurrent check-out hour_ledgers=%d; want 0 (draft does not post ledger)", len(hourLedgers))
+	}
+}
+
+func TestConcurrentSignupApprovalRespectsLastCapacitySlot(t *testing.T) {
+	now := time.Date(2026, 8, 21, 8, 0, 0, 0, time.UTC)
+	base := store.NewMemoryStore(nil, nil)
+	hasher := auth.NewPasswordHasher()
+	setup := NewServices(base, hasher, auth.NewSessionManager(time.Hour), fakeClock{t: now}, 3)
+	ctx := context.Background()
+	org := mustUser(t, base, hasher, "approval-org", "org123x", model.RoleOrganizer)
+	v1 := mustUser(t, base, hasher, "approval-v1", "pass123", model.RoleVolunteer)
+	v2 := mustUser(t, base, hasher, "approval-v2", "pass123", model.RoleVolunteer)
+	act, err := setup.Activity.Create(ctx, org, model.CreateActivityRequest{
+		Title: "并发审批活动", Content: "用于验证最后一个活动名额不会被并发审批重复占用", Category: model.CatCommunity,
+		Location: "社区", ContactName: "org", Capacity: 1, NeedApproval: true,
+		SignupOpenAt: now.Add(-time.Hour), SignupCloseAt: now.Add(24 * time.Hour),
+		StartAt: now.Add(48 * time.Hour), EndAt: now.Add(50 * time.Hour), PlannedMinutes: 120, Publish: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1, err := setup.Signup.Signup(ctx, v1, act.ID, model.SignupRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := setup.Signup.Signup(ctx, v2, act.ID, model.SignupRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &signupApprovalBarrierStore{Store: base, ready: make(chan struct{}, 2), release: make(chan struct{})}
+	svc := NewServices(barrier, hasher, auth.NewSessionManager(time.Hour), fakeClock{t: now}, 3)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, id := range []string{s1.ID, s2.ID} {
+		wg.Add(1)
+		go func(signupID string) {
+			defer wg.Done()
+			_, err := svc.Signup.Approve(ctx, org, signupID)
+			errs <- err
+		}(id)
+	}
+	<-barrier.ready
+	<-barrier.ready
+	close(barrier.release)
+	wg.Wait()
+	close(errs)
+	succeeded, full := 0, 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, model.ErrCapacityFull):
+			full++
+		default:
+			t.Fatalf("unexpected approval error: %v", err)
+		}
+	}
+	approved, err := base.CountApprovedByActivity(ctx, act.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if succeeded != 1 || full != 1 || approved != 1 {
+		t.Fatalf("concurrent approvals: succeeded=%d capacity_full=%d approved=%d; want 1,1,1", succeeded, full, approved)
 	}
 }
