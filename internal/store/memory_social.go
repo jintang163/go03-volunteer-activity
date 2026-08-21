@@ -62,6 +62,27 @@ func (m *MemoryStore) CreateTeamMember(_ context.Context, mem model.TeamMember) 
 	return mem, nil
 }
 
+// ReserveTeamMember 在单次写锁内原子地完成「检查同一团队同一用户是否已是成员 + 写入记录」。
+// 它消除 Invite 此前「先 GetTeamMember 检查、后 CreateTeamMember 写入」两步之间的
+// TOCTOU 竞态：两个并发邀请请求都通过存在性检查后，第二个进入写锁时重新读到已写入的
+// 成员记录，即返回 ErrAlreadyTeamMember，从而保证同一用户在同一团队只能建立一条成员关系，
+// 避免成员列表出现重复记录。
+func (m *MemoryStore) ReserveTeamMember(_ context.Context, mem model.TeamMember) (model.TeamMember, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, ex := range m.teamMembers {
+		if ex.TeamID == mem.TeamID && ex.UserID == mem.UserID {
+			return model.TeamMember{}, model.ErrAlreadyTeamMember
+		}
+	}
+	if mem.ID == "" {
+		mem.ID = m.idGen(model.MemberIDPrefix)
+	}
+	m.teamMembers[mem.ID] = mem
+	m.persist()
+	return mem, nil
+}
+
 func (m *MemoryStore) ListTeamMembers(_ context.Context, teamID string) ([]model.TeamMember, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

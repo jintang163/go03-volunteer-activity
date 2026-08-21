@@ -68,6 +68,11 @@ type Store interface {
 	ListTeams(ctx context.Context, ownerID string) ([]model.Team, error)
 	UpdateTeam(ctx context.Context, t model.Team) (model.Team, error)
 	CreateTeamMember(ctx context.Context, m model.TeamMember) (model.TeamMember, error)
+	// ReserveTeamMember 在单次写锁内原子地完成「检查同一团队同一用户是否已是成员 + 写入记录」，
+	// 消除「先 GetTeamMember 检查、后 CreateTeamMember 写入」之间的 TOCTOU 竞态：
+	// 同一时刻最多只有一个并发请求能在锁内确认尚无成员关系并写入，其余进入锁内时已读到
+	// 已存在的成员记录，即返回 ErrAlreadyTeamMember，从而保证同一用户在同一团队只能建立一条成员关系。
+	ReserveTeamMember(ctx context.Context, m model.TeamMember) (model.TeamMember, error)
 	ListTeamMembers(ctx context.Context, teamID string) ([]model.TeamMember, error)
 	GetTeamMember(ctx context.Context, teamID, userID string) (model.TeamMember, error)
 	DeleteTeamMember(ctx context.Context, teamID, userID string) error

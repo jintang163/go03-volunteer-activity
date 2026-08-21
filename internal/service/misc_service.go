@@ -130,7 +130,12 @@ func (s *TeamService) Invite(ctx context.Context, actor model.User, teamID strin
 	if _, err := s.store.GetTeamMember(ctx, teamID, u.ID); err == nil {
 		return model.TeamMember{}, model.ErrAlreadyTeamMember
 	}
-	return s.store.CreateTeamMember(ctx, model.TeamMember{
+	// 原子地完成「检查是否已是成员 + 写入」。此前采用先 GetTeamMember 检查、后 CreateTeamMember
+	// 写入的两步式流程，两次加锁之间存在 TOCTOU 竞态：团队所有者并发邀请同一用户两次时，两个
+	// 请求都能通过存在性检查而各自写入，最终成员列表出现两条该用户记录。现把检查与写入下沉到
+	// store.ReserveTeamMember 的单次写锁内，第二个请求在锁内重新读到已存在的成员记录即返回
+	// ErrAlreadyTeamMember，保证同一用户在同一团队只能建立一条成员关系。
+	return s.store.ReserveTeamMember(ctx, model.TeamMember{
 		TeamID:   teamID,
 		UserID:   u.ID,
 		Role:     "member",

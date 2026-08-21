@@ -40,16 +40,18 @@ type feedbackBarrierStore struct {
 	release chan struct{}
 }
 
+// teamMemberBarrierStore 在 ReserveTeamMember（修复后的原子写入点）上设置同步屏障，
+// 让并发邀请请求都抵达决策临界区后再同时放行，最大化竞态窗口以稳定复现重复成员记录。
 type teamMemberBarrierStore struct {
 	store.Store
 	ready   chan struct{}
 	release chan struct{}
 }
 
-func (s *teamMemberBarrierStore) CreateTeamMember(ctx context.Context, member model.TeamMember) (model.TeamMember, error) {
+func (s *teamMemberBarrierStore) ReserveTeamMember(ctx context.Context, member model.TeamMember) (model.TeamMember, error) {
 	s.ready <- struct{}{}
 	<-s.release
-	return s.Store.CreateTeamMember(ctx, member)
+	return s.Store.ReserveTeamMember(ctx, member)
 }
 
 func (s *feedbackBarrierStore) ReserveFeedback(ctx context.Context, feedback model.Feedback) (model.Feedback, error) {
