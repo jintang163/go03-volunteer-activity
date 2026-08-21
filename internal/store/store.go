@@ -39,6 +39,11 @@ type Store interface {
 	CountNoShowsSince(ctx context.Context, volunteerID string, since time.Time) (int, error)
 
 	CreateCheckIn(ctx context.Context, c model.CheckIn) (model.CheckIn, error)
+	// ReserveCheckIn 在单次写锁内原子地完成「检查同一活动同一志愿者是否已签到 + 写入记录」，
+	// 消除「先 GetCheckInByActivityVolunteer 检查、后 CreateCheckIn 写入」之间的 TOCTOU 竞态：
+	// 同一时刻最多只有一个并发请求能在锁内确认尚无签到记录并写入，其余进入锁内时已读到
+	// 已存在的签到记录，即返回 ErrAlreadyCheckedIn，从而保证同一志愿者在同一活动只能签到一次。
+	ReserveCheckIn(ctx context.Context, c model.CheckIn) (model.CheckIn, error)
 	GetCheckIn(ctx context.Context, id string) (model.CheckIn, error)
 	GetCheckInByActivityVolunteer(ctx context.Context, activityID, volunteerID string) (model.CheckIn, error)
 	ListCheckInsByActivity(ctx context.Context, activityID string) ([]model.CheckIn, error)
