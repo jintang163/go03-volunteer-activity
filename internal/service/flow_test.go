@@ -48,16 +48,18 @@ type teamMemberBarrierStore struct {
 	release chan struct{}
 }
 
+// checkOutBarrierStore 在 ReserveCheckOut（修复后的原子写入点）上设置同步屏障，
+// 让并发签退请求都抵达决策临界区后再同时放行，最大化竞态窗口以稳定复现重复签退。
 type checkOutBarrierStore struct {
 	store.Store
 	ready   chan struct{}
 	release chan struct{}
 }
 
-func (s *checkOutBarrierStore) UpdateCheckIn(ctx context.Context, checkIn model.CheckIn) (model.CheckIn, error) {
+func (s *checkOutBarrierStore) ReserveCheckOut(ctx context.Context, checkIn model.CheckIn) (model.CheckIn, error) {
 	s.ready <- struct{}{}
 	<-s.release
-	return s.Store.UpdateCheckIn(ctx, checkIn)
+	return s.Store.ReserveCheckOut(ctx, checkIn)
 }
 
 func (s *teamMemberBarrierStore) ReserveTeamMember(ctx context.Context, member model.TeamMember) (model.TeamMember, error) {
@@ -643,5 +645,24 @@ func TestConcurrentCheckOutTransitionsOnce(t *testing.T) {
 	}
 	if succeeded != 1 || already != 1 {
 		t.Fatalf("concurrent check-out result: succeeded=%d already_checked_out=%d; want 1,1", succeeded, already)
+	}
+	// 签退状态只能迁移一次意味着 autoDraftHours 也只能随胜出请求触发一次：
+	// 同一志愿者在该活动下只能存在一条工时草拟，且没有任何工时/积分流水被重复生成。
+	hours, err := base.ListHoursByActivity(ctx, act.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hours) != 1 {
+		t.Fatalf("concurrent check-out hours=%d; want 1 (auto-draft must not fire twice)", len(hours))
+	}
+	if hours[0].WorkMinutes != 90 {
+		t.Fatalf("auto-draft work minutes=%d; want 90", hours[0].WorkMinutes)
+	}
+	hourLedgers, err := base.ListHourLedgers(ctx, vol.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hourLedgers) != 0 {
+		t.Fatalf("concurrent check-out hour_ledgers=%d; want 0 (draft does not post ledger)", len(hourLedgers))
 	}
 }

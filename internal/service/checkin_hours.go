@@ -83,7 +83,13 @@ func (s *CheckInService) CheckOut(ctx context.Context, actor model.User, activit
 	}
 	ci.CheckOutAt = &now
 	ci.UpdatedAt = now
-	saved, err := s.store.UpdateCheckIn(ctx, ci)
+	// 原子地完成「校验签到记录尚未签退 + 写入签退时间」。此前采用先 GetCheckInByActivityVolunteer
+	// 检查 HasCheckedOut、后 UpdateCheckIn 写入的两步式流程，两次加锁之间存在 TOCTOU 竞态：
+	// 同一志愿者并发发起两次签退时，两个请求都能读到未签退状态而通过检查，随后各自写入并
+	// 继续执行 autoDraftHours，最终两个请求都返回成功、工时草拟被触发两次。现把状态校验与
+	// 写入下沉到 store.ReserveCheckOut 的单次写锁内，第二个请求在锁内重新读到记录已带签退
+	// 时间即返回 ErrAlreadyCheckedOut，保证同一签到记录的签退状态只能迁移一次。
+	saved, err := s.store.ReserveCheckOut(ctx, ci)
 	if err != nil {
 		return model.CheckIn{}, err
 	}
