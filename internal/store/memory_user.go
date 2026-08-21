@@ -236,6 +236,98 @@ func (m *MemoryStore) CreateSignup(_ context.Context, s model.Signup) (model.Sig
 	return s, nil
 }
 
+// ReserveSignup 在单次写锁内原子地完成录取判定并写入报名记录。
+// 它把 decideStatus 的「检查容量/候补/冲突/审批」与 CreateSignup 的写入合并为
+// 一个不可分割的临界区：并发请求串行进入写锁，第二个请求在锁内重新计数时看到
+// 已达上限即返回 ErrCapacityFull，从而保证同一时刻最多一个请求成功录取。
+func (m *MemoryStore) ReserveSignup(_ context.Context, s model.Signup, act model.Activity) (model.Signup, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	approved, wait := 0, 0
+	for _, ex := range m.signups {
+		if ex.ActivityID != act.ID {
+			continue
+		}
+		switch ex.Status {
+		case model.SignupApproved:
+			approved++
+		case model.SignupWaitlisted:
+			wait++
+		}
+	}
+
+	if approved >= act.Capacity {
+		if !act.WaitlistEnabled {
+			return model.Signup{}, model.ErrCapacityFull
+		}
+		if wait >= act.WaitlistLimit {
+			return model.Signup{}, model.ErrWaitlistFull
+		}
+		// 候补席：跳过时间冲突判定（候补可在递补时再校验），直接分配序号写入。
+		s.Status = model.SignupWaitlisted
+		if s.WaitlistSeq == 0 {
+			s.WaitlistSeq = m.nextWaitlistSeqLocked(act.ID)
+		}
+	} else {
+		// 时间冲突判定：与该志愿者已被录取的其他活动在时间上是否重叠。
+		overlap := false
+		for _, ex := range m.signups {
+			if ex.VolunteerID != s.VolunteerID || ex.Status != model.SignupApproved {
+				continue
+			}
+			if ex.ActivityID == act.ID {
+				continue
+			}
+			other, ok := m.activities[ex.ActivityID]
+			if !ok || other.Status == model.ActivityCancelled {
+				continue
+			}
+			if act.StartAt.Before(other.EndAt) && other.StartAt.Before(act.EndAt) {
+				overlap = true
+				break
+			}
+		}
+		if overlap {
+			if act.WaitlistEnabled {
+				if wait >= act.WaitlistLimit {
+					return model.Signup{}, model.ErrWaitlistFull
+				}
+				s.Status = model.SignupWaitlisted
+				if s.WaitlistSeq == 0 {
+					s.WaitlistSeq = m.nextWaitlistSeqLocked(act.ID)
+				}
+			} else {
+				return model.Signup{}, model.ErrScheduleConflict
+			}
+		} else if act.NeedApproval {
+			s.Status = model.SignupPending
+		} else {
+			s.Status = model.SignupApproved
+			t := s.CreatedAt
+			s.ApprovedAt = &t
+		}
+	}
+
+	if s.ID == "" {
+		s.ID = m.idGen(model.SignupIDPrefix)
+	}
+	m.signups[s.ID] = s
+	m.persist()
+	return s, nil
+}
+
+// nextWaitlistSeqLocked 返回该活动下一个候补序号。调用方必须已持有 m.mu。
+func (m *MemoryStore) nextWaitlistSeqLocked(activityID string) int {
+	max := 0
+	for _, s := range m.signups {
+		if s.ActivityID == activityID && s.WaitlistSeq > max {
+			max = s.WaitlistSeq
+		}
+	}
+	return max + 1
+}
+
 func (m *MemoryStore) GetSignup(_ context.Context, id string) (model.Signup, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
