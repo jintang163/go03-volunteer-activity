@@ -52,7 +52,12 @@ func (s *CheckInService) SelfCheckIn(ctx context.Context, actor model.User, acti
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
-	saved, err := s.store.CreateCheckIn(ctx, rec)
+	// 原子地完成「检查是否已签到 + 写入」。此前采用先 GetCheckInByActivityVolunteer 检查、
+	// 后 CreateCheckIn 写入的两步式流程，两次加锁之间存在 TOCTOU 竞态：同一志愿者并发提交
+	// 两次正确签到码时，两个请求都能通过存在性检查而各自写入，最终保存两条签到记录。现把
+	// 检查与写入下沉到 store.ReserveCheckIn 的单次写锁内，第二个请求在锁内重新读到已存在的
+	// 签到记录即返回 ErrAlreadyCheckedIn，保证同一志愿者在同一活动只能签到一次。
+	saved, err := s.store.ReserveCheckIn(ctx, rec)
 	if err != nil {
 		return model.CheckIn{}, err
 	}
@@ -128,7 +133,9 @@ func (s *CheckInService) ProxyCheckIn(ctx context.Context, actor model.User, act
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
-	saved, err := s.store.CreateCheckIn(ctx, rec)
+	// 同 SelfCheckIn：把存在性检查与写入合并进 store.ReserveCheckIn 的单次写锁，
+	// 消除「先 GetCheckInByActivityVolunteer、后 CreateCheckIn」之间的 TOCTOU 竞态。
+	saved, err := s.store.ReserveCheckIn(ctx, rec)
 	if err != nil {
 		return model.CheckIn{}, err
 	}

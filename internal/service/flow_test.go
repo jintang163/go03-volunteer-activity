@@ -32,10 +32,12 @@ type checkInBarrierStore struct {
 	release chan struct{}
 }
 
-func (s *checkInBarrierStore) CreateCheckIn(ctx context.Context, checkIn model.CheckIn) (model.CheckIn, error) {
+// checkInBarrierStore 在 ReserveCheckIn（修复后的原子写入点）上设置同步屏障，
+// 让并发签到请求都抵达决策临界区后再同时放行，最大化竞态窗口以稳定复现重复签到。
+func (s *checkInBarrierStore) ReserveCheckIn(ctx context.Context, checkIn model.CheckIn) (model.CheckIn, error) {
 	s.ready <- struct{}{}
 	<-s.release
-	return s.Store.CreateCheckIn(ctx, checkIn)
+	return s.Store.ReserveCheckIn(ctx, checkIn)
 }
 
 func (s *hoursApprovalBarrierStore) ApplyHourApproval(ctx context.Context, hour model.HourRecord, hl model.HourLedger, pl model.PointLedger) (model.HourRecord, model.User, error) {

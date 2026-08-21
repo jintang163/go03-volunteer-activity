@@ -19,6 +19,27 @@ func (m *MemoryStore) CreateCheckIn(_ context.Context, c model.CheckIn) (model.C
 	return c, nil
 }
 
+// ReserveCheckIn 在单次写锁内原子地完成「检查同一活动同一志愿者是否已签到 + 写入记录」。
+// 它消除 SelfCheckIn/ProxyCheckIn 此前「先 GetCheckInByActivityVolunteer 检查、后 CreateCheckIn
+// 写入」两步之间的 TOCTOU 竞态：两个并发签到请求都通过存在性检查后，第二个进入写锁时
+// 重新读到已写入的签到记录，即返回 ErrAlreadyCheckedIn，从而保证同一志愿者在同一活动只能
+// 成功签到一次，避免重复生成签到记录。
+func (m *MemoryStore) ReserveCheckIn(_ context.Context, c model.CheckIn) (model.CheckIn, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, ex := range m.checkins {
+		if ex.ActivityID == c.ActivityID && ex.VolunteerID == c.VolunteerID {
+			return model.CheckIn{}, model.ErrAlreadyCheckedIn
+		}
+	}
+	if c.ID == "" {
+		c.ID = m.idGen(model.CheckInIDPrefix)
+	}
+	m.checkins[c.ID] = c
+	m.persist()
+	return c, nil
+}
+
 func (m *MemoryStore) GetCheckIn(_ context.Context, id string) (model.CheckIn, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
