@@ -168,16 +168,19 @@ func (s *SignupService) Cancel(ctx context.Context, actor model.User, signupID s
 	if sg.VolunteerID != actor.ID && !canManageActivity(actor, act) {
 		return model.Signup{}, model.ErrForbidden
 	}
-	if !sg.Status.IsActive() {
-		return model.Signup{}, model.ErrConflict
-	}
 	now := s.clock.Now()
 	wasApproved := sg.Status == model.SignupApproved
 	late := wasApproved && !now.Before(act.StartAt)
 	sg.Status = model.SignupCancelled
 	sg.CancelledAt = &now
 	sg.UpdatedAt = now
-	saved, err := s.store.UpdateSignup(ctx, sg)
+	// 原子地完成「校验报名仍处于有效状态 + 写入已取消状态」。此前采用先 GetSignup 读取状态、
+	// IsActive 检查、后 UpdateSignup 写入的两步式流程，两次加锁之间存在 TOCTOU 竞态：同一条
+	// 已录取报名在活动开始后的两个并发取消请求都能读到有效状态而通过检查，随后各自写入已取消
+	// 状态，最终产生两次迟到扣分流水与两次候补递补。现把状态校验与写入下沉到
+	// store.ReserveSignupCancellation 的单次写锁内，同一时刻至多一个请求成功迁移状态，其余在锁内
+	// 重新读到报名已是 cancelled 即返回 ErrConflict，迟到扣分与候补递补只随胜出请求触发一次。
+	saved, err := s.store.ReserveSignupCancellation(ctx, sg, act)
 	if err != nil {
 		return model.Signup{}, err
 	}

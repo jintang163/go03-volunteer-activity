@@ -443,6 +443,28 @@ func (m *MemoryStore) ReserveSignupApproval(_ context.Context, s model.Signup, a
 	return s, nil
 }
 
+// ReserveSignupCancellation 在单次写锁内原子地完成「校验报名仍处于有效状态 + 写入已取消状态」。
+// 它消除 Cancel 此前「先 GetSignup 读取状态、IsActive 检查、后 UpdateSignup 写入」两步之间的
+// TOCTOU 竞态：同一条已录取报名在活动开始后的两个并发取消请求都读到有效状态而通过检查后，
+// 第二个进入写锁时重新读到报名已是 cancelled，即返回 ErrConflict，从而保证同一报名的取消状态
+// 只能迁移一次，且迟到扣分、候补递补等后续副作用只随胜出请求触发一次。
+func (m *MemoryStore) ReserveSignupCancellation(_ context.Context, s model.Signup, act model.Activity) (model.Signup, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, ok := m.signups[s.ID]
+	if !ok {
+		return model.Signup{}, model.ErrNotFound
+	}
+	// 锁内重新校验状态：仅有效状态（pending/approved/waitlisted）可取消，已被并发取消处理过的
+	// 报名直接返回当前记录 + ErrConflict，使服务层据此跳过迟到扣分与候补递补等副作用。
+	if !current.Status.IsActive() {
+		return current, model.ErrConflict
+	}
+	m.signups[s.ID] = s
+	m.persist()
+	return s, nil
+}
+
 func (m *MemoryStore) CountApprovedByActivity(_ context.Context, activityID string) (int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

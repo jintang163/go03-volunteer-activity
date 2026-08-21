@@ -64,18 +64,18 @@ type signupApprovalBarrierStore struct {
 	release chan struct{}
 }
 
+// signupCancelBarrierStore 在 ReserveSignupCancellation（修复后的原子写入点）上设置同步屏障，
+// 让并发取消请求都抵达决策临界区后再同时放行，最大化竞态窗口以稳定复现重复取消与重复迟到扣分。
 type signupCancelBarrierStore struct {
 	store.Store
 	ready   chan struct{}
 	release chan struct{}
 }
 
-func (s *signupCancelBarrierStore) UpdateSignup(ctx context.Context, signup model.Signup) (model.Signup, error) {
-	if signup.Status == model.SignupCancelled {
-		s.ready <- struct{}{}
-		<-s.release
-	}
-	return s.Store.UpdateSignup(ctx, signup)
+func (s *signupCancelBarrierStore) ReserveSignupCancellation(ctx context.Context, signup model.Signup, act model.Activity) (model.Signup, error) {
+	s.ready <- struct{}{}
+	<-s.release
+	return s.Store.ReserveSignupCancellation(ctx, signup, act)
 }
 
 func (s *signupApprovalBarrierStore) ReserveSignupApproval(ctx context.Context, signup model.Signup, act model.Activity) (model.Signup, error) {
