@@ -48,6 +48,18 @@ type teamMemberBarrierStore struct {
 	release chan struct{}
 }
 
+type checkOutBarrierStore struct {
+	store.Store
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (s *checkOutBarrierStore) UpdateCheckIn(ctx context.Context, checkIn model.CheckIn) (model.CheckIn, error) {
+	s.ready <- struct{}{}
+	<-s.release
+	return s.Store.UpdateCheckIn(ctx, checkIn)
+}
+
 func (s *teamMemberBarrierStore) ReserveTeamMember(ctx context.Context, member model.TeamMember) (model.TeamMember, error) {
 	s.ready <- struct{}{}
 	<-s.release
@@ -573,5 +585,63 @@ func TestConcurrentTeamInviteCreatesSingleMembership(t *testing.T) {
 	}
 	if succeeded != 1 || duplicate != 1 || targetCount != 1 {
 		t.Fatalf("concurrent invite result: succeeded=%d already_member=%d target_memberships=%d; want 1,1,1", succeeded, duplicate, targetCount)
+	}
+}
+
+func TestConcurrentCheckOutTransitionsOnce(t *testing.T) {
+	start := time.Date(2026, 8, 21, 10, 0, 0, 0, time.UTC)
+	now := start.Add(90 * time.Minute)
+	base := store.NewMemoryStore(nil, nil)
+	hasher := auth.NewPasswordHasher()
+	ctx := context.Background()
+	org := mustUser(t, base, hasher, "checkout-org", "org123x", model.RoleOrganizer)
+	vol := mustUser(t, base, hasher, "checkout-vol", "pass123", model.RoleVolunteer)
+	act, err := base.CreateActivity(ctx, model.Activity{OrganizerID: org.ID, Title: "并发签退活动", Capacity: 5, StartAt: start, EndAt: start.Add(2 * time.Hour), PlannedMinutes: 120, CheckOutGrace: 60, Status: model.ActivityInProgress, CreatedAt: start})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signup, err := base.CreateSignup(ctx, model.Signup{ActivityID: act.ID, VolunteerID: vol.ID, Status: model.SignupApproved, CreatedAt: start.Add(-time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base.CreateCheckIn(ctx, model.CheckIn{ActivityID: act.ID, VolunteerID: vol.ID, SignupID: signup.ID, CheckInAt: start, CreatedAt: start}); err != nil {
+		t.Fatal(err)
+	}
+	barrier := &checkOutBarrierStore{Store: base, ready: make(chan struct{}, 2), release: make(chan struct{})}
+	svc := NewServices(barrier, hasher, auth.NewSessionManager(time.Hour), fakeClock{t: now}, 3)
+
+	type result struct {
+		checkIn model.CheckIn
+		err     error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			updated, checkOutErr := svc.CheckIn.CheckOut(ctx, vol, act.ID)
+			results <- result{checkIn: updated, err: checkOutErr}
+		}()
+	}
+	<-barrier.ready
+	<-barrier.ready
+	close(barrier.release)
+	wg.Wait()
+	close(results)
+
+	succeeded, already := 0, 0
+	for result := range results {
+		switch {
+		case result.err == nil && result.checkIn.HasCheckedOut():
+			succeeded++
+		case errors.Is(result.err, model.ErrAlreadyCheckedOut):
+			already++
+		default:
+			t.Fatalf("unexpected check-out result: record=%+v err=%v", result.checkIn, result.err)
+		}
+	}
+	if succeeded != 1 || already != 1 {
+		t.Fatalf("concurrent check-out result: succeeded=%d already_checked_out=%d; want 1,1", succeeded, already)
 	}
 }
