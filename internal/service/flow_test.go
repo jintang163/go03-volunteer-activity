@@ -72,6 +72,30 @@ type signupCancelBarrierStore struct {
 	release chan struct{}
 }
 
+type noShowBarrierStore struct {
+	store.Store
+	activityReady   chan struct{}
+	activityRelease chan struct{}
+	noShowReady     chan struct{}
+	noShowRelease   chan struct{}
+}
+
+func (s *noShowBarrierStore) UpdateActivity(ctx context.Context, activity model.Activity) (model.Activity, error) {
+	if activity.Status == model.ActivityCompleted {
+		s.activityReady <- struct{}{}
+		<-s.activityRelease
+	}
+	return s.Store.UpdateActivity(ctx, activity)
+}
+
+func (s *noShowBarrierStore) UpdateSignup(ctx context.Context, signup model.Signup) (model.Signup, error) {
+	if signup.Status == model.SignupNoShow {
+		s.noShowReady <- struct{}{}
+		<-s.noShowRelease
+	}
+	return s.Store.UpdateSignup(ctx, signup)
+}
+
 func (s *signupCancelBarrierStore) ReserveSignupCancellation(ctx context.Context, signup model.Signup, act model.Activity) (model.Signup, error) {
 	s.ready <- struct{}{}
 	<-s.release
@@ -803,5 +827,55 @@ func TestConcurrentLateCancellationAppliesPenaltyOnce(t *testing.T) {
 	}
 	if succeeded != 1 || conflicts != 1 || len(ledgers) != 1 {
 		t.Fatalf("concurrent late cancellation: succeeded=%d conflicts=%d point_ledgers=%d; want 1,1,1", succeeded, conflicts, len(ledgers))
+	}
+}
+
+func TestConcurrentActivityCompletionMarksNoShowOnce(t *testing.T) {
+	open := time.Date(2026, 8, 21, 8, 0, 0, 0, time.UTC)
+	base := store.NewMemoryStore(nil, nil)
+	hasher := auth.NewPasswordHasher()
+	setup := NewServices(base, hasher, auth.NewSessionManager(time.Hour), fakeClock{t: open}, 3)
+	ctx := context.Background()
+	org := mustUser(t, base, hasher, "complete-org", "org123x", model.RoleOrganizer)
+	vol := mustUser(t, base, hasher, "complete-vol", "pass123", model.RoleVolunteer)
+	act, err := setup.Activity.Create(ctx, org, model.CreateActivityRequest{Title: "并发完成活动", Content: "验证并发完成不会重复记录缺席扣分", Category: model.CatCommunity, Location: "社区", ContactName: "org", Capacity: 2, SignupOpenAt: open.Add(-time.Hour), SignupCloseAt: open.Add(time.Hour), StartAt: open.Add(2 * time.Hour), EndAt: open.Add(4 * time.Hour), PlannedMinutes: 120, Publish: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setup.Signup.Signup(ctx, vol, act.ID, model.SignupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	barrier := &noShowBarrierStore{Store: base, activityReady: make(chan struct{}, 2), activityRelease: make(chan struct{}), noShowReady: make(chan struct{}, 2), noShowRelease: make(chan struct{})}
+	svc := NewServices(barrier, hasher, auth.NewSessionManager(time.Hour), fakeClock{t: open.Add(5 * time.Hour)}, 3)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _, err := svc.Activity.Complete(ctx, org, act.ID); errs <- err }()
+	}
+	<-barrier.activityReady
+	<-barrier.activityReady
+	close(barrier.activityRelease)
+	<-barrier.noShowReady
+	<-barrier.noShowReady
+	close(barrier.noShowRelease)
+	wg.Wait()
+	close(errs)
+	succeeded, invalid := 0, 0
+	for err := range errs {
+		if err == nil {
+			succeeded++
+		} else if errors.Is(err, model.ErrInvalidActivityStatus) {
+			invalid++
+		} else {
+			t.Fatalf("unexpected complete error: %v", err)
+		}
+	}
+	ledgers, err := base.ListPointLedgers(ctx, vol.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if succeeded != 1 || invalid != 1 || len(ledgers) != 1 {
+		t.Fatalf("concurrent completion: succeeded=%d invalid_status=%d point_ledgers=%d; want 1,1,1", succeeded, invalid, len(ledgers))
 	}
 }
