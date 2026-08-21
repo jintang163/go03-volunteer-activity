@@ -90,6 +90,11 @@ type Store interface {
 	CreateFeedback(ctx context.Context, f model.Feedback) (model.Feedback, error)
 	GetFeedback(ctx context.Context, activityID, volunteerID string) (model.Feedback, error)
 	ListFeedbackByActivity(ctx context.Context, activityID string) ([]model.Feedback, error)
+	// ReserveFeedback 在单次写锁内原子地完成「检查同一活动同一志愿者是否已反馈 + 写入记录」，
+	// 消除「先 GetFeedback 检查、后 CreateFeedback 写入」之间的 TOCTOU 竞态：
+	// 同一时刻最多只有一个并发请求能在锁内确认尚无反馈记录并写入，其余进入锁内时已读到
+	// 已存在的反馈记录，即返回 ErrAlreadyFeedback，从而保证同一志愿者在同一活动只能反馈一次。
+	ReserveFeedback(ctx context.Context, f model.Feedback) (model.Feedback, error)
 
 	// ApplyHourApproval 在单次写锁内原子地完成「校验工时仍在待审 + 入账工时与积分 +
 	// 写两条流水」。它把 Approve 此前「先 GetHour 检查状态、后入账」两步间留下的

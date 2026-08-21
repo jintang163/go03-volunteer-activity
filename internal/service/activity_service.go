@@ -441,13 +441,18 @@ func (s *ActivityService) SubmitFeedback(ctx context.Context, actor model.User, 
 	if req.Score < 1 || req.Score > 5 {
 		return model.Feedback{}, model.ErrInvalidScore
 	}
-	if _, err := s.store.GetFeedback(ctx, activityID, actor.ID); err == nil {
-		return model.Feedback{}, model.ErrAlreadyFeedback
-	}
 	if _, err := s.store.GetCheckInByActivityVolunteer(ctx, activityID, actor.ID); err != nil {
 		return model.Feedback{}, model.ErrNotCheckedIn
 	}
-	return s.store.CreateFeedback(ctx, model.Feedback{
+	if _, err := s.store.GetFeedback(ctx, activityID, actor.ID); err == nil {
+		return model.Feedback{}, model.ErrAlreadyFeedback
+	}
+	// 原子地完成「检查是否已反馈 + 写入」。此前采用先 GetFeedback 检查、后 CreateFeedback
+	// 写入的两步式流程，两次加锁之间存在 TOCTOU 竞态：同一志愿者对已完成活动并发提交两次
+	// 反馈时，两个请求都能通过存在性检查而各自写入，最终活动保存两条反馈。现把检查与写入
+	// 下沉到 store.ReserveFeedback 的单次写锁内，第二个请求在锁内重新读到已存在的反馈记录
+	// 即返回 ErrAlreadyFeedback，保证同一志愿者在同一活动只能反馈一次。
+	return s.store.ReserveFeedback(ctx, model.Feedback{
 		ActivityID:  activityID,
 		VolunteerID: actor.ID,
 		Score:       req.Score,
