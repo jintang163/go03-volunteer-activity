@@ -64,6 +64,20 @@ type signupApprovalBarrierStore struct {
 	release chan struct{}
 }
 
+type signupCancelBarrierStore struct {
+	store.Store
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (s *signupCancelBarrierStore) UpdateSignup(ctx context.Context, signup model.Signup) (model.Signup, error) {
+	if signup.Status == model.SignupCancelled {
+		s.ready <- struct{}{}
+		<-s.release
+	}
+	return s.Store.UpdateSignup(ctx, signup)
+}
+
 func (s *signupApprovalBarrierStore) ReserveSignupApproval(ctx context.Context, signup model.Signup, act model.Activity) (model.Signup, error) {
 	s.ready <- struct{}{}
 	<-s.release
@@ -741,5 +755,53 @@ func TestConcurrentSignupApprovalRespectsLastCapacitySlot(t *testing.T) {
 	}
 	if succeeded != 1 || full != 1 || approved != 1 {
 		t.Fatalf("concurrent approvals: succeeded=%d capacity_full=%d approved=%d; want 1,1,1", succeeded, full, approved)
+	}
+}
+
+func TestConcurrentLateCancellationAppliesPenaltyOnce(t *testing.T) {
+	open := time.Date(2026, 8, 21, 8, 0, 0, 0, time.UTC)
+	base := store.NewMemoryStore(nil, nil)
+	hasher := auth.NewPasswordHasher()
+	setup := NewServices(base, hasher, auth.NewSessionManager(time.Hour), fakeClock{t: open}, 3)
+	ctx := context.Background()
+	org := mustUser(t, base, hasher, "cancel-org", "org123x", model.RoleOrganizer)
+	vol := mustUser(t, base, hasher, "cancel-vol", "pass123", model.RoleVolunteer)
+	act, err := setup.Activity.Create(ctx, org, model.CreateActivityRequest{Title: "迟到取消活动", Content: "验证并发取消只产生一次迟到扣分", Category: model.CatCommunity, Location: "社区", ContactName: "org", Capacity: 2, SignupOpenAt: open.Add(-time.Hour), SignupCloseAt: open.Add(time.Hour), StartAt: open.Add(2 * time.Hour), EndAt: open.Add(4 * time.Hour), PlannedMinutes: 120, Publish: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sg, err := setup.Signup.Signup(ctx, vol, act.ID, model.SignupRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &signupCancelBarrierStore{Store: base, ready: make(chan struct{}, 2), release: make(chan struct{})}
+	svc := NewServices(barrier, hasher, auth.NewSessionManager(time.Hour), fakeClock{t: open.Add(3 * time.Hour)}, 3)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _, err := svc.Signup.Cancel(ctx, vol, sg.ID); errs <- err }()
+	}
+	<-barrier.ready
+	<-barrier.ready
+	close(barrier.release)
+	wg.Wait()
+	close(errs)
+	succeeded, conflicts := 0, 0
+	for err := range errs {
+		if err == nil {
+			succeeded++
+		} else if errors.Is(err, model.ErrConflict) {
+			conflicts++
+		} else {
+			t.Fatalf("unexpected cancel error: %v", err)
+		}
+	}
+	ledgers, err := base.ListPointLedgers(ctx, vol.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if succeeded != 1 || conflicts != 1 || len(ledgers) != 1 {
+		t.Fatalf("concurrent late cancellation: succeeded=%d conflicts=%d point_ledgers=%d; want 1,1,1", succeeded, conflicts, len(ledgers))
 	}
 }
