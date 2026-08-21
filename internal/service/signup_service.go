@@ -109,26 +109,18 @@ func (s *SignupService) Approve(ctx context.Context, actor model.User, signupID 
 	if sg.Status != model.SignupPending && sg.Status != model.SignupWaitlisted {
 		return model.Signup{}, model.ErrConflict
 	}
-	approved, err := s.store.CountApprovedByActivity(ctx, act.ID)
-	if err != nil {
-		return model.Signup{}, err
-	}
-	if approved >= act.Capacity {
-		return model.Signup{}, model.ErrCapacityFull
-	}
-	overlap, err := s.store.ListApprovedOverlapping(ctx, sg.VolunteerID, act.StartAt, act.EndAt, act.ID)
-	if err != nil {
-		return model.Signup{}, err
-	}
-	if len(overlap) > 0 {
-		return model.Signup{}, model.ErrScheduleConflict
-	}
 	now := s.clock.Now()
 	sg.Status = model.SignupApproved
 	sg.WaitlistSeq = 0
 	sg.ApprovedAt = &now
 	sg.UpdatedAt = now
-	saved, err := s.store.UpdateSignup(ctx, sg)
+	// 原子地完成「容量检查 + 时间冲突校验 + 写入已录取」。此前采用先 CountApprovedByActivity
+	// 检查容量、ListApprovedOverlapping 检查冲突、后 UpdateSignup 写入的两步式流程，两次加锁
+	// 之间存在 TOCTOU 竞态：只剩最后一个名额时，两条待处理报名的并发审批都能读到 approved <
+	// capacity 而判定录取，随后各自写入已录取状态，最终录取人数超过活动容量。现把容量检查、
+	// 冲突校验与写入下沉到 store.ReserveSignupApproval 的单次写锁内，同一时刻至多一个请求成功
+	// 占用名额，其余在锁内重新计数时发现已满即返回 ErrCapacityFull，活动录取计数保持一致。
+	saved, err := s.store.ReserveSignupApproval(ctx, sg, act)
 	if err != nil {
 		return model.Signup{}, err
 	}

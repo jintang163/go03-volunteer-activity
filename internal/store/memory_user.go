@@ -392,6 +392,57 @@ func (m *MemoryStore) UpdateSignup(_ context.Context, s model.Signup) (model.Sig
 	return s, nil
 }
 
+// ReserveSignupApproval 在单次写锁内原子地完成「校验报名仍待审批 + 容量是否已满 +
+// 时间是否冲突 + 写入已录取状态」。它消除 Approve 此前「先 CountApprovedByActivity 检查容量、
+// ListApprovedOverlapping 检查冲突、后 UpdateSignup 写入」两步之间的 TOCTOU 竞态：两个并发
+// 审批请求都读到 approved < capacity 而通过检查后，第二个进入写锁时重新计数发现已达上限即
+// 返回 ErrCapacityFull，从而保证最后一个名额只能被一条报名成功占用，且活动录取计数保持一致。
+func (m *MemoryStore) ReserveSignupApproval(_ context.Context, s model.Signup, act model.Activity) (model.Signup, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	current, ok := m.signups[s.ID]
+	if !ok {
+		return model.Signup{}, model.ErrNotFound
+	}
+	// 锁内重新校验状态：仅 pending/waitlisted 可录取，已被并发审批处理过的报名直接报冲突。
+	if current.Status != model.SignupPending && current.Status != model.SignupWaitlisted {
+		return current, model.ErrConflict
+	}
+
+	// 锁内重新计数已录取人数：与 ReserveSignup 同一判定口径，第二个请求进入时名额已被占用。
+	approved := 0
+	for _, ex := range m.signups {
+		if ex.ActivityID == act.ID && ex.Status == model.SignupApproved {
+			approved++
+		}
+	}
+	if approved >= act.Capacity {
+		return current, model.ErrCapacityFull
+	}
+
+	// 锁内重新校验时间冲突：与本志愿者已被录取的其他活动在时间上是否重叠。
+	for _, ex := range m.signups {
+		if ex.VolunteerID != s.VolunteerID || ex.Status != model.SignupApproved {
+			continue
+		}
+		if ex.ActivityID == act.ID {
+			continue
+		}
+		other, ok := m.activities[ex.ActivityID]
+		if !ok || other.Status == model.ActivityCancelled {
+			continue
+		}
+		if act.StartAt.Before(other.EndAt) && other.StartAt.Before(act.EndAt) {
+			return current, model.ErrScheduleConflict
+		}
+	}
+
+	m.signups[s.ID] = s
+	m.persist()
+	return s, nil
+}
+
 func (m *MemoryStore) CountApprovedByActivity(_ context.Context, activityID string) (int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

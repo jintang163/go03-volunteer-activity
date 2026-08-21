@@ -32,6 +32,12 @@ type Store interface {
 	ListSignupsByActivity(ctx context.Context, activityID string) ([]model.Signup, error)
 	ListSignupsByVolunteer(ctx context.Context, volunteerID string) ([]model.Signup, error)
 	UpdateSignup(ctx context.Context, s model.Signup) (model.Signup, error)
+	// ReserveSignupApproval 在单次写锁内原子地完成「校验报名仍待审批 + 容量是否已满 +
+	// 时间是否冲突 + 写入已录取状态」。它消除 Approve 此前「先 CountApprovedByActivity 检查容量、
+	// ListApprovedOverlapping 检查冲突、后 UpdateSignup 写入」两步之间的 TOCTOU 竞态：两个并发
+	// 审批请求都读到 approved < capacity 而通过检查后，第二个进入写锁时重新计数发现已达上限即
+	// 返回 ErrCapacityFull，从而保证最后一个名额只能被一条报名成功占用，且活动录取计数保持一致。
+	ReserveSignupApproval(ctx context.Context, s model.Signup, act model.Activity) (model.Signup, error)
 	CountApprovedByActivity(ctx context.Context, activityID string) (int, error)
 	CountWaitlistByActivity(ctx context.Context, activityID string) (int, error)
 	NextWaitlistSeq(ctx context.Context, activityID string) (int, error)

@@ -56,18 +56,18 @@ type checkOutBarrierStore struct {
 	release chan struct{}
 }
 
+// signupApprovalBarrierStore 在 ReserveSignupApproval（修复后的原子写入点）上设置同步屏障，
+// 让并发审批请求都抵达决策临界区后再同时放行，最大化竞态窗口以稳定复现超额录取。
 type signupApprovalBarrierStore struct {
 	store.Store
 	ready   chan struct{}
 	release chan struct{}
 }
 
-func (s *signupApprovalBarrierStore) UpdateSignup(ctx context.Context, signup model.Signup) (model.Signup, error) {
-	if signup.Status == model.SignupApproved {
-		s.ready <- struct{}{}
-		<-s.release
-	}
-	return s.Store.UpdateSignup(ctx, signup)
+func (s *signupApprovalBarrierStore) ReserveSignupApproval(ctx context.Context, signup model.Signup, act model.Activity) (model.Signup, error) {
+	s.ready <- struct{}{}
+	<-s.release
+	return s.Store.ReserveSignupApproval(ctx, signup, act)
 }
 
 func (s *checkOutBarrierStore) ReserveCheckOut(ctx context.Context, checkIn model.CheckIn) (model.CheckIn, error) {
