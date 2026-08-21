@@ -298,12 +298,13 @@ func (s *HoursService) Approve(ctx context.Context, actor model.User, hourID str
 	if req.Note != "" {
 		h.Note = validate.SanitizePlain(req.Note)
 	}
-	u, err := s.store.GetUserByID(ctx, h.VolunteerID)
-	if err != nil {
-		return model.HourRecord{}, err
-	}
 	pts := policy.PointsForMinutes(h.WorkMinutes)
-	saved, _, err := s.store.ApplyHoursAndPoints(ctx, h, u, model.HourLedger{
+	// 原子入账：把「校验工时仍在待审 + 累加工时与积分 + 写两条流水」合并进
+	// store.ApplyHourApproval 的单次写锁内。此前采用先 GetHour 检查状态、后
+	// ApplyHoursAndPoints 入账的两步式流程，两次加锁之间存在 TOCTOU 竞态：并发审批
+	// 都能读到 pending 而通过校验，随后各自入账，造成工时翻倍、积分翻倍与重复账本。
+	// 现在第二个请求在锁内重新读到 approved 即返回 ErrHoursNotPending，保证只入账一次。
+	saved, _, err := s.store.ApplyHourApproval(ctx, h, model.HourLedger{
 		UserID:     h.VolunteerID,
 		HourID:     h.ID,
 		ActivityID: h.ActivityID,

@@ -202,13 +202,22 @@ func (m *MemoryStore) ListPointLedgers(_ context.Context, userID string) ([]mode
 	return out, nil
 }
 
-func (m *MemoryStore) ApplyHoursAndPoints(_ context.Context, hour model.HourRecord, user model.User, hl model.HourLedger, pl model.PointLedger) (model.HourRecord, model.User, error) {
+// ApplyHourApproval 在单次写锁内原子地完成「校验工时仍在待审 + 入账工时与积分 +
+// 写两条流水」。它消除 Approve 此前「先 GetHour 读状态、后 ApplyHoursAndPoints 入账」
+// 两步之间的 TOCTOU 竞态：两个并发审批请求都读到 pending 通过校验后，第二个进入写锁时
+// 重新读到工时已是 approved，即返回 ErrHoursNotPending，从而保证同一条工时只能成功入账
+// 一次，避免重复累加工时、积分与重复生成账本。
+func (m *MemoryStore) ApplyHourApproval(_ context.Context, hour model.HourRecord, hl model.HourLedger, pl model.PointLedger) (model.HourRecord, model.User, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.hours[hour.ID]; !ok {
+	current, ok := m.hours[hour.ID]
+	if !ok {
 		return model.HourRecord{}, model.User{}, model.ErrNotFound
 	}
-	u, ok := m.users[user.ID]
+	if current.Status != model.HourPending && current.Status != model.HourDraft {
+		return model.HourRecord{}, model.User{}, model.ErrHoursNotPending
+	}
+	u, ok := m.users[hour.VolunteerID]
 	if !ok {
 		return model.HourRecord{}, model.User{}, model.ErrNotFound
 	}
@@ -220,7 +229,7 @@ func (m *MemoryStore) ApplyHoursAndPoints(_ context.Context, hour model.HourReco
 	if u.Points < 0 {
 		u.Points = 0
 	}
-	u.UpdatedAt = user.UpdatedAt
+	u.UpdatedAt = hour.UpdatedAt
 	hl.BalanceMin = u.TotalMinutes
 	pl.Balance = u.Points
 	if hl.ID == "" {

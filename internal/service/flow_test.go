@@ -26,10 +26,10 @@ type hoursApprovalBarrierStore struct {
 	release chan struct{}
 }
 
-func (s *hoursApprovalBarrierStore) ApplyHoursAndPoints(ctx context.Context, hour model.HourRecord, user model.User, hl model.HourLedger, pl model.PointLedger) (model.HourRecord, model.User, error) {
+func (s *hoursApprovalBarrierStore) ApplyHourApproval(ctx context.Context, hour model.HourRecord, hl model.HourLedger, pl model.PointLedger) (model.HourRecord, model.User, error) {
 	s.ready <- struct{}{}
 	<-s.release
-	return s.Store.ApplyHoursAndPoints(ctx, hour, user, hl, pl)
+	return s.Store.ApplyHourApproval(ctx, hour, hl, pl)
 }
 
 func (s *capacityBarrierStore) ReserveSignup(ctx context.Context, sg model.Signup, act model.Activity) (model.Signup, error) {
