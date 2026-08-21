@@ -12,20 +12,18 @@ import (
 	"go03-volunteer-activity/internal/store"
 )
 
+// capacityBarrierStore 在 ReserveSignup（修复后的原子写入点）上设置同步屏障，
+// 让并发报名请求都抵达决策临界区后再同时放行，最大化竞态窗口以稳定复现超额录取。
 type capacityBarrierStore struct {
 	store.Store
 	ready   chan struct{}
 	release chan struct{}
 }
 
-func (s *capacityBarrierStore) CountApprovedByActivity(ctx context.Context, activityID string) (int, error) {
-	count, err := s.Store.CountApprovedByActivity(ctx, activityID)
-	if err != nil {
-		return 0, err
-	}
+func (s *capacityBarrierStore) ReserveSignup(ctx context.Context, sg model.Signup, act model.Activity) (model.Signup, error) {
 	s.ready <- struct{}{}
 	<-s.release
-	return count, nil
+	return s.Store.ReserveSignup(ctx, sg, act)
 }
 
 type fakeClock struct{ t time.Time }

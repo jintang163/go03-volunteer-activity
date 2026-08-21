@@ -23,6 +23,10 @@ type Store interface {
 	CountActivitiesByStatus(ctx context.Context) (map[model.ActivityStatus]int, error)
 
 	CreateSignup(ctx context.Context, s model.Signup) (model.Signup, error)
+	// ReserveSignup 在单次写锁内原子地完成容量/候补/冲突/审批判定并写入报名记录，
+	// 消除「先 CountApprovedByActivity 检查、后 CreateSignup 写入」之间的 TOCTOU 竞态：
+	// 同一时刻最多只有一个并发请求能通过容量检查，其余在锁内重新计数时发现已满而失败。
+	ReserveSignup(ctx context.Context, s model.Signup, act model.Activity) (model.Signup, error)
 	GetSignup(ctx context.Context, id string) (model.Signup, error)
 	GetSignupByActivityVolunteer(ctx context.Context, activityID, volunteerID string) (model.Signup, error)
 	ListSignupsByActivity(ctx context.Context, activityID string) ([]model.Signup, error)

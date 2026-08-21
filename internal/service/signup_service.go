@@ -72,30 +72,24 @@ func (s *SignupService) Signup(ctx context.Context, actor model.User, activityID
 		return model.Signup{}, model.ErrAlreadySignedUp
 	}
 
-	status, seq, err := s.decideStatus(ctx, act, actor)
-	if err != nil {
-		return model.Signup{}, err
-	}
+	// 原子地完成「容量/候补/冲突/审批判定 + 写入」。此前采用先 CountApprovedByActivity
+	// 检查、后 CreateSignup 写入的两步式流程，两次加锁之间存在 TOCTOU 竞态：并发请求
+	// 都能读到 approved < capacity 而判定录取，最终保存多条已录取记录造成超额。现把
+	// 整个决策与写入下沉到 store.ReserveSignup 的单次写锁内，同一时刻至多一个请求成功。
 	sg := model.Signup{
 		ActivityID:  activityID,
 		VolunteerID: actor.ID,
-		Status:      status,
 		Remark:      validate.SanitizePlain(req.Remark),
-		WaitlistSeq: seq,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
-	if status == model.SignupApproved {
-		t := now
-		sg.ApprovedAt = &t
-	}
-	saved, err := s.store.CreateSignup(ctx, sg)
+	saved, err := s.store.ReserveSignup(ctx, sg, act)
 	if err != nil {
 		return model.Signup{}, err
 	}
 	_, _ = s.store.RecountActivityCounters(ctx, act.ID)
 	msg := "报名已提交"
-	switch status {
+	switch saved.Status {
 	case model.SignupApproved:
 		msg = "你已录取「" + act.Title + "」"
 	case model.SignupWaitlisted:
@@ -105,48 +99,6 @@ func (s *SignupService) Signup(ctx context.Context, actor model.User, activityID
 	}
 	_ = s.notify.Push(ctx, actor.ID, model.NotifySignupResult, "报名结果", msg, act.ID)
 	return saved, nil
-}
-
-func (s *SignupService) decideStatus(ctx context.Context, act model.Activity, volunteer model.User) (model.SignupStatus, int, error) {
-	approved, err := s.store.CountApprovedByActivity(ctx, act.ID)
-	if err != nil {
-		return "", 0, err
-	}
-	if approved >= act.Capacity {
-		if !act.WaitlistEnabled {
-			return "", 0, model.ErrCapacityFull
-		}
-		wl, err := s.store.CountWaitlistByActivity(ctx, act.ID)
-		if err != nil {
-			return "", 0, err
-		}
-		if wl >= act.WaitlistLimit {
-			return "", 0, model.ErrWaitlistFull
-		}
-		seq, err := s.store.NextWaitlistSeq(ctx, act.ID)
-		if err != nil {
-			return "", 0, err
-		}
-		return model.SignupWaitlisted, seq, nil
-	}
-	overlap, err := s.store.ListApprovedOverlapping(ctx, volunteer.ID, act.StartAt, act.EndAt, act.ID)
-	if err != nil {
-		return "", 0, err
-	}
-	if len(overlap) > 0 {
-		if act.WaitlistEnabled {
-			seq, err := s.store.NextWaitlistSeq(ctx, act.ID)
-			if err != nil {
-				return "", 0, err
-			}
-			return model.SignupWaitlisted, seq, nil
-		}
-		return "", 0, model.ErrScheduleConflict
-	}
-	if act.NeedApproval {
-		return model.SignupPending, 0, nil
-	}
-	return model.SignupApproved, 0, nil
 }
 
 func (s *SignupService) Approve(ctx context.Context, actor model.User, signupID string) (model.Signup, error) {
