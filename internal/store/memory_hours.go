@@ -84,6 +84,27 @@ func (m *MemoryStore) UpdateCheckIn(_ context.Context, c model.CheckIn) (model.C
 	return c, nil
 }
 
+// ReserveCheckOut 在单次写锁内原子地完成「校验签到记录尚未签退 + 写入签退时间」。
+// 它消除 CheckOut 此前「先 GetCheckInByActivityVolunteer 检查 HasCheckedOut、后
+// UpdateCheckIn 写入」两步之间的 TOCTOU 竞态：同一志愿者的两个并发签退请求都读到
+// 未签退状态而通过检查后，第二个进入写锁时重新读到记录已带签退时间，即返回
+// ErrAlreadyCheckedOut，从而保证同一签到记录的签退状态只能迁移一次，且签退后的
+// 工时草拟只随胜出请求触发一次。
+func (m *MemoryStore) ReserveCheckOut(_ context.Context, c model.CheckIn) (model.CheckIn, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, ok := m.checkins[c.ID]
+	if !ok {
+		return model.CheckIn{}, model.ErrNotFound
+	}
+	if current.HasCheckedOut() {
+		return current, model.ErrAlreadyCheckedOut
+	}
+	m.checkins[c.ID] = c
+	m.persist()
+	return c, nil
+}
+
 func (m *MemoryStore) CountCheckInsOnDay(_ context.Context, day time.Time) (int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

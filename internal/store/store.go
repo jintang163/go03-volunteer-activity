@@ -48,6 +48,12 @@ type Store interface {
 	GetCheckInByActivityVolunteer(ctx context.Context, activityID, volunteerID string) (model.CheckIn, error)
 	ListCheckInsByActivity(ctx context.Context, activityID string) ([]model.CheckIn, error)
 	UpdateCheckIn(ctx context.Context, c model.CheckIn) (model.CheckIn, error)
+	// ReserveCheckOut 在单次写锁内原子地完成「校验签到记录尚未签退 + 写入签退时间」，
+	// 消除 CheckOut 此前「先 GetCheckInByActivityVolunteer 检查 HasCheckedOut、后 UpdateCheckIn
+	// 写入」之间的 TOCTOU 竞态：同一志愿者的两个并发签退请求都读到未签退状态而通过检查后，
+	// 第二个进入写锁时重新读到记录已带签退时间，即返回 ErrAlreadyCheckedOut，从而保证同一
+	// 签到记录的签退状态只能迁移一次，且签退后的工时草拟只随胜出请求触发一次。
+	ReserveCheckOut(ctx context.Context, c model.CheckIn) (model.CheckIn, error)
 	CountCheckInsOnDay(ctx context.Context, day time.Time) (int, error)
 
 	CreateHour(ctx context.Context, h model.HourRecord) (model.HourRecord, error)
