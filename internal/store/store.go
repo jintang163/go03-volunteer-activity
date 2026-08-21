@@ -19,6 +19,12 @@ type Store interface {
 	GetActivity(ctx context.Context, id string) (model.Activity, error)
 	ListActivities(ctx context.Context, f model.ActivityFilter) ([]model.Activity, error)
 	UpdateActivity(ctx context.Context, a model.Activity) (model.Activity, error)
+	// ReserveActivityCompletion 在单次写锁内原子地完成「校验活动尚未处于终态 + 写入已完成状态」。
+	// 它消除 Complete 此前「先 GetActivity 读状态、IsTerminal 检查、后 UpdateActivity 写入」两步之间的
+	// TOCTOU 竞态：同一场已结束活动的两个并发完成请求都读到非终态而通过检查后，第二个进入写锁时
+	// 重新读到活动已是 completed，即返回 ErrInvalidActivityStatus，从而保证活动状态只能迁移一次，
+	// 且缺席扣分、通知等后续副作用只随胜出请求触发一次。
+	ReserveActivityCompletion(ctx context.Context, a model.Activity) (model.Activity, error)
 	CountActivitiesByOrganizerOpen(ctx context.Context, organizerID string) (int, error)
 	CountActivitiesByStatus(ctx context.Context) (map[model.ActivityStatus]int, error)
 

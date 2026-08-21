@@ -173,6 +173,29 @@ func (m *MemoryStore) UpdateActivity(_ context.Context, a model.Activity) (model
 	return a, nil
 }
 
+// ReserveActivityCompletion 在单次写锁内原子地完成「校验活动尚未处于终态 + 写入已完成状态」。
+// 它消除 Complete 此前「先 GetActivity 读状态、IsTerminal 检查、后 UpdateActivity 写入」两步之间的
+// TOCTOU 竞态：同一场已结束活动的两个并发完成请求都读到非终态而通过检查后，第二个进入写锁时
+// 重新读到活动已是 completed（或 cancelled），即返回当前记录 + ErrInvalidActivityStatus，从而保证
+// 活动状态只能迁移一次，且缺席扣分、通知等后续副作用只随胜出请求触发一次。
+func (m *MemoryStore) ReserveActivityCompletion(_ context.Context, a model.Activity) (model.Activity, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, ok := m.activities[a.ID]
+	if !ok {
+		return model.Activity{}, model.ErrNotFound
+	}
+	// 锁内重新校验状态：仅非终态可完成，已被并发完成处理过的活动直接返回当前记录 + ErrInvalidActivityStatus，
+	// 使服务层据此跳过 markNoShows 等副作用。
+	if current.Status.IsTerminal() {
+		return current, model.ErrInvalidActivityStatus
+	}
+	a.RequiredSkills = cloneStrings(a.RequiredSkills)
+	m.activities[a.ID] = a
+	m.persist()
+	return a, nil
+}
+
 func (m *MemoryStore) CountActivitiesByOrganizerOpen(_ context.Context, organizerID string) (int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

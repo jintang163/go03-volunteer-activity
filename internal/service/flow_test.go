@@ -72,28 +72,18 @@ type signupCancelBarrierStore struct {
 	release chan struct{}
 }
 
+// noShowBarrierStore 在 ReserveActivityCompletion（修复后的原子写入点）上设置同步屏障，
+// 让并发完成请求都抵达决策临界区后再同时放行，最大化竞态窗口以稳定复现重复标记缺席与重复扣分。
 type noShowBarrierStore struct {
 	store.Store
-	activityReady   chan struct{}
-	activityRelease chan struct{}
-	noShowReady     chan struct{}
-	noShowRelease   chan struct{}
+	ready   chan struct{}
+	release chan struct{}
 }
 
-func (s *noShowBarrierStore) UpdateActivity(ctx context.Context, activity model.Activity) (model.Activity, error) {
-	if activity.Status == model.ActivityCompleted {
-		s.activityReady <- struct{}{}
-		<-s.activityRelease
-	}
-	return s.Store.UpdateActivity(ctx, activity)
-}
-
-func (s *noShowBarrierStore) UpdateSignup(ctx context.Context, signup model.Signup) (model.Signup, error) {
-	if signup.Status == model.SignupNoShow {
-		s.noShowReady <- struct{}{}
-		<-s.noShowRelease
-	}
-	return s.Store.UpdateSignup(ctx, signup)
+func (s *noShowBarrierStore) ReserveActivityCompletion(ctx context.Context, activity model.Activity) (model.Activity, error) {
+	s.ready <- struct{}{}
+	<-s.release
+	return s.Store.ReserveActivityCompletion(ctx, activity)
 }
 
 func (s *signupCancelBarrierStore) ReserveSignupCancellation(ctx context.Context, signup model.Signup, act model.Activity) (model.Signup, error) {
@@ -845,7 +835,7 @@ func TestConcurrentActivityCompletionMarksNoShowOnce(t *testing.T) {
 	if _, err := setup.Signup.Signup(ctx, vol, act.ID, model.SignupRequest{}); err != nil {
 		t.Fatal(err)
 	}
-	barrier := &noShowBarrierStore{Store: base, activityReady: make(chan struct{}, 2), activityRelease: make(chan struct{}), noShowReady: make(chan struct{}, 2), noShowRelease: make(chan struct{})}
+	barrier := &noShowBarrierStore{Store: base, ready: make(chan struct{}, 2), release: make(chan struct{})}
 	svc := NewServices(barrier, hasher, auth.NewSessionManager(time.Hour), fakeClock{t: open.Add(5 * time.Hour)}, 3)
 	errs := make(chan error, 2)
 	var wg sync.WaitGroup
@@ -853,12 +843,9 @@ func TestConcurrentActivityCompletionMarksNoShowOnce(t *testing.T) {
 		wg.Add(1)
 		go func() { defer wg.Done(); _, err := svc.Activity.Complete(ctx, org, act.ID); errs <- err }()
 	}
-	<-barrier.activityReady
-	<-barrier.activityReady
-	close(barrier.activityRelease)
-	<-barrier.noShowReady
-	<-barrier.noShowReady
-	close(barrier.noShowRelease)
+	<-barrier.ready
+	<-barrier.ready
+	close(barrier.release)
 	wg.Wait()
 	close(errs)
 	succeeded, invalid := 0, 0

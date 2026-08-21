@@ -235,14 +235,18 @@ func (s *ActivityService) Complete(ctx context.Context, actor model.User, id str
 	if !canManageActivity(actor, act) {
 		return model.PublicActivity{}, model.ErrNotOrganizer
 	}
-	if act.Status.IsTerminal() {
-		return model.PublicActivity{}, model.ErrInvalidActivityStatus
-	}
 	now := s.clock.Now()
 	act.Status = model.ActivityCompleted
 	act.CompletedAt = &now
 	act.UpdatedAt = now
-	saved, err := s.store.UpdateActivity(ctx, act)
+	// 原子地完成「校验活动尚未处于终态 + 写入已完成状态」。此前采用先 GetActivity 读取状态、
+	// IsTerminal 检查、后 UpdateActivity 写入的两步式流程，两次加锁之间存在 TOCTOU 竞态：同一场
+	// 已结束活动的两个并发完成请求都能读到非终态而通过检查，随后各自写入已完成状态，最终
+	// markNoShows 会对同一名未签到志愿者重复标记缺席并扣分两次、发送两次通知。现把状态校验与
+	// 写入下沉到 store.ReserveActivityCompletion 的单次写锁内，同一时刻至多一个请求成功迁移状态，
+	// 其余在锁内重新读到活动已是 completed 即返回 ErrInvalidActivityStatus，缺席扣分与通知只随
+	// 胜出请求触发一次。
+	saved, err := s.store.ReserveActivityCompletion(ctx, act)
 	if err != nil {
 		return model.PublicActivity{}, err
 	}
