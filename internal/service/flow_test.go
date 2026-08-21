@@ -32,16 +32,18 @@ type checkInBarrierStore struct {
 	release chan struct{}
 }
 
+// feedbackBarrierStore 在 ReserveFeedback（修复后的原子写入点）上设置同步屏障，
+// 让并发反馈请求都抵达决策临界区后再同时放行，最大化竞态窗口以稳定复现重复反馈。
 type feedbackBarrierStore struct {
 	store.Store
 	ready   chan struct{}
 	release chan struct{}
 }
 
-func (s *feedbackBarrierStore) CreateFeedback(ctx context.Context, feedback model.Feedback) (model.Feedback, error) {
+func (s *feedbackBarrierStore) ReserveFeedback(ctx context.Context, feedback model.Feedback) (model.Feedback, error) {
 	s.ready <- struct{}{}
 	<-s.release
-	return s.Store.CreateFeedback(ctx, feedback)
+	return s.Store.ReserveFeedback(ctx, feedback)
 }
 
 // checkInBarrierStore 在 ReserveCheckIn（修复后的原子写入点）上设置同步屏障，

@@ -263,6 +263,27 @@ func (m *MemoryStore) CreateFeedback(_ context.Context, f model.Feedback) (model
 	return f, nil
 }
 
+// ReserveFeedback 在单次写锁内原子地完成「检查同一活动同一志愿者是否已反馈 + 写入记录」。
+// 它消除 SubmitFeedback 此前「先 GetFeedback 检查、后 CreateFeedback 写入」两步之间的
+// TOCTOU 竞态：两个并发反馈请求都通过存在性检查后，第二个进入写锁时重新读到已写入的
+// 反馈记录，即返回 ErrAlreadyFeedback，从而保证同一志愿者在同一活动只能成功反馈一次，
+// 避免活动最终保存多条反馈。
+func (m *MemoryStore) ReserveFeedback(_ context.Context, f model.Feedback) (model.Feedback, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, ex := range m.feedbacks {
+		if ex.ActivityID == f.ActivityID && ex.VolunteerID == f.VolunteerID {
+			return model.Feedback{}, model.ErrAlreadyFeedback
+		}
+	}
+	if f.ID == "" {
+		f.ID = m.idGen(model.FeedbackIDPrefix)
+	}
+	m.feedbacks[f.ID] = f
+	m.persist()
+	return f, nil
+}
+
 func (m *MemoryStore) GetFeedback(_ context.Context, activityID, volunteerID string) (model.Feedback, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
