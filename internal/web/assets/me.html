@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8" /><title>我的</title>
+<link rel="stylesheet" href="/static/style.css" /></head>
+<body>
+<div class="topbar"><span class="brand">我的主页</span><div class="nav" id="userbar"></div></div>
+<div class="layout">
+  <div class="card" id="profile"></div>
+  <div class="card"><h2>我的报名</h2><div id="signups" class="list"></div></div>
+  <div class="card"><h2>我的工时</h2><div id="hours" class="list"></div></div>
+  <div class="card"><h2>证书</h2><div id="certs" class="list"></div></div>
+  <div class="card"><h2>通知</h2><div id="notes" class="list"></div></div>
+</div>
+<script src="/static/app.js"></script>
+<script>
+if (!requireLogin()) {}
+currentMe().then(async me => {
+  fillUserBar(me);
+  const u = me.user;
+  $("profile").innerHTML = `<h2>${u.display_name}</h2>
+    <div class="stats-grid">
+      <div class="stat"><div class="k">累计分钟</div><div class="v">${u.total_minutes}</div></div>
+      <div class="stat"><div class="k">积分</div><div class="v">${u.points}</div></div>
+      <div class="stat"><div class="k">缺席</div><div class="v">${u.no_show_count}</div></div>
+      <div class="stat"><div class="k">下一证书</div><div class="v">${me.next_certificate_tier||"已满"}</div></div>
+    </div>`;
+  const sgs = await api("/api/me/signups");
+  $("signups").innerHTML = sgs.map(s => `<div class="post"><div class="meta">${s.activity_id} · ${statusLabel(s.status)}</div>
+    ${s.status==="pending"||s.status==="approved"||s.status==="waitlisted"?`<button class="btn" onclick="cancelSg('${s.id}')">取消</button>`:""}</div>`).join("") || "暂无";
+  const hrs = await api("/api/me/hours");
+  $("hours").innerHTML = hrs.map(h => `<div class="post">${h.activity_id} · ${h.work_minutes} 分钟 · ${statusLabel(h.status)}</div>`).join("") || "暂无";
+  const certs = await api("/api/me/certificates");
+  $("certs").innerHTML = certs.map(c => `<div class="post">${c.tier} · 核验码 ${c.code}</div>`).join("") || "暂无证书";
+  const notes = await api("/api/me/notifications");
+  $("notes").innerHTML = notes.map(n => `<div class="post"><b>${n.title}</b> ${n.body}</div>`).join("") || "暂无";
+});
+async function cancelSg(id) {
+  try { await api("/api/signups/"+id+"/cancel", {method:"POST", body:"{}"}); location.reload(); } catch(e){ alert(e.message); }
+}
+</script>
+</body></html>

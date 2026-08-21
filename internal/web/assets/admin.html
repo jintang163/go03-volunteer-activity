@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8" /><title>管理后台</title>
+<link rel="stylesheet" href="/static/style.css" /></head>
+<body>
+<div class="topbar"><span class="brand">管理后台</span><div class="nav" id="userbar"></div></div>
+<div class="layout">
+  <div class="card"><h2>全站统计</h2><div class="stats-grid" id="stats"></div></div>
+  <div class="card">
+    <div class="card-head"><h2>用户</h2>
+      <form id="cu" class="filters">
+        <input name="username" placeholder="用户名" required />
+        <input name="display_name" placeholder="显示名" required />
+        <input name="password" placeholder="口令" required />
+        <select name="role"><option value="volunteer">志愿者</option><option value="organizer">组织者</option></select>
+        <button class="btn btn-primary" type="submit">创建</button>
+      </form>
+    </div>
+    <table class="table"><thead><tr><th>用户</th><th>角色</th><th>状态</th><th>工时</th><th></th></tr></thead><tbody id="users"></tbody></table>
+  </div>
+</div>
+<script src="/static/app.js"></script>
+<script>
+if (!requireLogin()) {}
+currentMe().then(fillUserBar);
+api("/api/stats").then(s => {
+  $("stats").innerHTML = `<div class="stat"><div class="k">用户</div><div class="v">${s.users_total}</div></div>
+    <div class="stat"><div class="k">录取报名</div><div class="v">${s.signups_approved}</div></div>
+    <div class="stat"><div class="k">候补</div><div class="v">${s.signups_waitlist}</div></div>
+    <div class="stat"><div class="k">本月工时分钟</div><div class="v">${s.hours_this_month_minutes}</div></div>
+    <div class="stat"><div class="k">待审工时</div><div class="v">${s.pending_hours}</div></div>`;
+});
+async function loadUsers() {
+  const list = await api("/api/users");
+  $("users").innerHTML = list.map(u => `<tr><td>${u.display_name} (${u.username})</td><td>${u.role}</td><td>${u.status}</td><td>${u.total_minutes}</td>
+    <td>${u.status==="active"?`<button class="btn" onclick="fr('${u.id}')">冻结</button>`:`<button class="btn" onclick="un('${u.id}')">解冻</button>`}</td></tr>`).join("");
+}
+loadUsers();
+$("cu").onsubmit = async e => {
+  e.preventDefault();
+  const fd = new FormData($("cu"));
+  try { await api("/api/users", {method:"POST", body: JSON.stringify({username:fd.get("username"), display_name:fd.get("display_name"), password:fd.get("password"), role:fd.get("role")})}); loadUsers(); }
+  catch(ex){ alert(ex.message); }
+};
+async function fr(id){ await api("/api/users/"+id+"/freeze",{method:"POST",body:"{}"}); loadUsers(); }
+async function un(id){ await api("/api/users/"+id+"/unfreeze",{method:"POST",body:"{}"}); loadUsers(); }
+</script>
+</body></html>

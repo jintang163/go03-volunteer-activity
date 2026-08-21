@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8" /><title>志愿者</title>
+<link rel="stylesheet" href="/static/style.css" /></head>
+<body>
+<div class="topbar"><span class="brand">志愿者活动</span><div class="nav" id="userbar"></div></div>
+<div class="layout">
+  <div class="card">
+    <div class="card-head"><h2>活动广场</h2>
+      <div class="filters">
+        <select id="cat"><option value="">全部分类</option></select>
+        <button class="btn" id="reload">刷新</button>
+      </div>
+    </div>
+    <div class="list" id="list"></div>
+    <p class="err" id="err"></p>
+  </div>
+</div>
+<script src="/static/app.js"></script>
+<script>
+if (!requireLogin()) {}
+else currentMe().then(fillUserBar);
+(async () => {
+  const cats = await api("/api/categories");
+  cats.forEach(c => { const o=document.createElement("option"); o.value=c.id; o.textContent=c.name; $("cat").appendChild(o); });
+})();
+async function load() {
+  $("err").textContent="";
+  try {
+    const q = $("cat").value ? ("?category="+$("cat").value) : "";
+    const list = await api("/api/activities"+q);
+    $("list").innerHTML = list.filter(a => a.status !== "draft").map(a => `
+      <div class="post">
+        <h3><a href="/activity/${a.id}">${a.title}</a></h3>
+        <div class="meta">
+          <span class="tag">${catLabel(a.category)}</span>
+          <span class="tag">${statusLabel(a.status)}</span>
+          <span>名额 ${a.approved_count}/${a.capacity}</span>
+          <span>${new Date(a.start_at).toLocaleString()} ~ ${new Date(a.end_at).toLocaleString()}</span>
+          <span>${a.location||""}</span>
+        </div>
+      </div>`).join("") || "<p class='subtitle'>暂无活动</p>";
+  } catch(ex) { $("err").textContent = ex.message; }
+}
+$("reload").onclick = load; $("cat").onchange = load; load();
+</script>
+</body></html>

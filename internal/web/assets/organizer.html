@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8" /><title>组织者</title>
+<link rel="stylesheet" href="/static/style.css" /></head>
+<body>
+<div class="topbar"><span class="brand">组织工作台</span><div class="nav" id="userbar"></div></div>
+<div class="layout">
+  <div class="card stats-grid" id="stats"></div>
+  <div class="card">
+    <h2>发布活动</h2>
+    <form id="f" class="form">
+      <label class="field"><span>标题</span><input name="title" required /></label>
+      <label class="field"><span>内容</span><textarea name="content" required></textarea></label>
+      <div class="row">
+        <label class="field"><span>分类</span><select name="category" id="cat"></select></label>
+        <label class="field"><span>地点</span><input name="location" required /></label>
+      </div>
+      <div class="row">
+        <label class="field"><span>名额</span><input name="capacity" type="number" value="10" /></label>
+        <label class="field"><span>联系人</span><input name="contact_name" value="组织者" /></label>
+      </div>
+      <div class="row">
+        <label class="field"><span>开始</span><input name="start_at" type="datetime-local" required /></label>
+        <label class="field"><span>结束</span><input name="end_at" type="datetime-local" required /></label>
+      </div>
+      <label class="field"><span><input type="checkbox" name="waitlist" checked /> 开启候补</span></label>
+      <label class="field"><span><input type="checkbox" name="need_approval" /> 需要审核</span></label>
+      <button class="btn btn-primary" type="submit">创建并发布</button>
+    </form>
+    <p class="err" id="err"></p>
+  </div>
+  <div class="card"><h2>我的活动</h2><div id="acts" class="list"></div></div>
+  <div class="card"><h2>待审工时</h2><div id="hours" class="list"></div></div>
+</div>
+<script src="/static/app.js"></script>
+<script>
+if (!requireLogin()) {}
+currentMe().then(fillUserBar);
+api("/api/categories").then(cs => cs.forEach(c => { const o=document.createElement("option"); o.value=c.id; o.textContent=c.name; $("cat").appendChild(o); }));
+api("/api/stats/organizer").then(s => {
+  $("stats").innerHTML = `<div class="stat"><div class="k">活动</div><div class="v">${s.my_activities}</div></div>
+    <div class="stat"><div class="k">录取</div><div class="v">${s.approved_people}</div></div>
+    <div class="stat"><div class="k">到场</div><div class="v">${s.checked_in}</div></div>
+    <div class="stat"><div class="k">待审工时</div><div class="v">${s.pending_hours}</div></div>`;
+});
+async function loadActs() {
+  const me = await currentMe();
+  const list = await api("/api/activities?organizer_id="+me.user.id);
+  $("acts").innerHTML = list.map(a => `<div class="post"><h3><a href="/activity/${a.id}">${a.title}</a> <span class="tag">${statusLabel(a.status)}</span></h3>
+    <div class="meta">签到码 ${a.check_in_code||"-"} · 录取 ${a.approved_count}/${a.capacity}</div>
+    <div class="actions">
+      ${a.status==="draft"?`<button class="btn" onclick="act('${a.id}','publish')">发布</button>`:""}
+      ${a.status==="published"?`<button class="btn" onclick="act('${a.id}','close-signup')">截止报名</button><button class="btn" onclick="act('${a.id}','start')">开场</button>`:""}
+      ${a.status==="in_progress"||a.status==="registration_closed"?`<button class="btn" onclick="act('${a.id}','complete')">结项</button>`:""}
+      ${a.status!=="completed"&&a.status!=="cancelled"?`<button class="btn btn-danger" onclick="act('${a.id}','cancel')">取消</button>`:""}
+    </div></div>`).join("");
+}
+loadActs();
+api("/api/hours/pending").then(list => {
+  $("hours").innerHTML = list.map(h => `<div class="post">${h.volunteer_id} · ${h.work_minutes} 分钟 · ${statusLabel(h.status)}
+    <button class="btn btn-primary" onclick="okHour('${h.id}')">通过</button>
+    <button class="btn" onclick="noHour('${h.id}')">驳回</button></div>`).join("") || "暂无";
+});
+$("f").onsubmit = async e => {
+  e.preventDefault(); $("err").textContent="";
+  const fd = new FormData($("f"));
+  const start = new Date(fd.get("start_at"));
+  const end = new Date(fd.get("end_at"));
+  const body = {
+    title: fd.get("title"), content: fd.get("content"), category: fd.get("category")||"community",
+    location: fd.get("location"), contact_name: fd.get("contact_name"), capacity: Number(fd.get("capacity")),
+    waitlist_enabled: fd.get("waitlist")==="on", need_approval: fd.get("need_approval")==="on",
+    start_at: start.toISOString(), end_at: end.toISOString(),
+    signup_open_at: new Date(Date.now()-3600e3).toISOString(),
+    signup_close_at: start.toISOString(),
+    publish: true
+  };
+  try { await api("/api/activities", {method:"POST", body: JSON.stringify(body)}); location.reload(); }
+  catch(ex){ $("err").textContent=ex.message; }
+};
+async function act(id, op) {
+  try { await api("/api/activities/"+id+"/"+op, {method:"POST", body: JSON.stringify({reason:"组织者操作"})}); location.reload(); }
+  catch(e){ alert(e.message); }
+}
+async function okHour(id){ try{ await api("/api/hours/"+id+"/approve",{method:"POST",body:"{}"}); location.reload();}catch(e){alert(e.message);} }
+async function noHour(id){ try{ await api("/api/hours/"+id+"/reject",{method:"POST",body:JSON.stringify({reason:"数据不符"})}); location.reload();}catch(e){alert(e.message);} }
+</script>
+</body></html>

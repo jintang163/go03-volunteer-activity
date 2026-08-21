@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8" /><title>活动详情</title>
+<link rel="stylesheet" href="/static/style.css" /></head>
+<body>
+<div class="topbar"><span class="brand">活动详情</span><div class="nav" id="userbar"></div></div>
+<div class="layout">
+  <div class="card" id="info"></div>
+  <div class="card">
+    <h2>报名 / 签到</h2>
+    <div class="actions">
+      <button class="btn btn-primary" id="btn-signup">报名</button>
+      <input id="code" placeholder="签到码" style="padding:8px 10px;border:1px solid var(--border);border-radius:8px" />
+      <button class="btn" id="btn-in">签到</button>
+      <button class="btn" id="btn-out">签退</button>
+    </div>
+    <p class="err" id="err"></p>
+    <p class="ok" id="ok"></p>
+  </div>
+</div>
+<script src="/static/app.js"></script>
+<script>
+if (!requireLogin()) {}
+const id = location.pathname.split("/").pop();
+let me;
+currentMe().then(m => { me = m; fillUserBar(m); });
+async function load() {
+  const a = await api("/api/activities/"+id);
+  $("info").innerHTML = `<h2>${a.title}</h2>
+    <div class="meta"><span class="tag">${catLabel(a.category)}</span><span class="tag">${statusLabel(a.status)}</span>
+    <span>名额 ${a.approved_count}/${a.capacity}${a.waitlist_enabled?" · 候补"+a.waitlist_count:""}</span></div>
+    <p>${a.content}</p>
+    <p class="meta">地点 ${a.location} · 计划 ${a.planned_minutes} 分钟<br>
+    报名 ${new Date(a.signup_open_at).toLocaleString()} ~ ${new Date(a.signup_close_at).toLocaleString()}<br>
+    活动 ${new Date(a.start_at).toLocaleString()} ~ ${new Date(a.end_at).toLocaleString()}</p>
+    ${a.check_in_code ? `<p>签到码：<b>${a.check_in_code}</b></p>` : ""}`;
+}
+load();
+$("btn-signup").onclick = async () => {
+  $("err").textContent=""; $("ok").textContent="";
+  try { await api("/api/activities/"+id+"/signup", {method:"POST", body:"{}"}); $("ok").textContent="报名成功"; load(); }
+  catch(ex){ $("err").textContent=ex.message; }
+};
+$("btn-in").onclick = async () => {
+  $("err").textContent=""; $("ok").textContent="";
+  try { await api("/api/activities/"+id+"/checkin", {method:"POST", body: JSON.stringify({code:$("code").value})}); $("ok").textContent="签到成功"; }
+  catch(ex){ $("err").textContent=ex.message; }
+};
+$("btn-out").onclick = async () => {
+  $("err").textContent=""; $("ok").textContent="";
+  try { await api("/api/activities/"+id+"/checkout", {method:"POST", body:"{}"}); $("ok").textContent="签退成功，待组织者审核工时"; }
+  catch(ex){ $("err").textContent=ex.message; }
+};
+</script>
+</body></html>
