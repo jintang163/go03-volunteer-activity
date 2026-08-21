@@ -32,6 +32,18 @@ type checkInBarrierStore struct {
 	release chan struct{}
 }
 
+type feedbackBarrierStore struct {
+	store.Store
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (s *feedbackBarrierStore) CreateFeedback(ctx context.Context, feedback model.Feedback) (model.Feedback, error) {
+	s.ready <- struct{}{}
+	<-s.release
+	return s.Store.CreateFeedback(ctx, feedback)
+}
+
 // checkInBarrierStore 在 ReserveCheckIn（修复后的原子写入点）上设置同步屏障，
 // 让并发签到请求都抵达决策临界区后再同时放行，最大化竞态窗口以稳定复现重复签到。
 func (s *checkInBarrierStore) ReserveCheckIn(ctx context.Context, checkIn model.CheckIn) (model.CheckIn, error) {
@@ -420,5 +432,67 @@ func TestConcurrentSelfCheckInCreatesSingleRecord(t *testing.T) {
 	}
 	if succeeded != 1 || duplicate != 1 || len(stored) != 1 {
 		t.Fatalf("concurrent check-in result: succeeded=%d already_checked_in=%d stored=%d; want 1,1,1", succeeded, duplicate, len(stored))
+	}
+}
+
+func TestConcurrentFeedbackCreatesSingleSubmission(t *testing.T) {
+	now := time.Date(2026, 8, 21, 15, 0, 0, 0, time.UTC)
+	base := store.NewMemoryStore(nil, nil)
+	barrier := &feedbackBarrierStore{Store: base, ready: make(chan struct{}, 2), release: make(chan struct{})}
+	hasher := auth.NewPasswordHasher()
+	svc := NewServices(barrier, hasher, auth.NewSessionManager(time.Hour), fakeClock{t: now}, 3)
+	ctx := context.Background()
+	org := mustUser(t, base, hasher, "feedback-org", "org123x", model.RoleOrganizer)
+	vol := mustUser(t, base, hasher, "feedback-vol", "pass123", model.RoleVolunteer)
+	act, err := base.CreateActivity(ctx, model.Activity{
+		OrganizerID: org.ID, Title: "已完成反馈活动", Content: "验证同一志愿者不会重复提交反馈",
+		Category: model.CatCommunity, Location: "社区", ContactName: "org", Capacity: 5,
+		StartAt: now.Add(-3 * time.Hour), EndAt: now.Add(-time.Hour), PlannedMinutes: 120,
+		Status: model.ActivityCompleted, CreatedAt: now.Add(-24 * time.Hour), UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base.CreateCheckIn(ctx, model.CheckIn{ActivityID: act.ID, VolunteerID: vol.ID, CheckInAt: act.StartAt, CreatedAt: act.StartAt}); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		feedback model.Feedback
+		err      error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			feedback, feedbackErr := svc.Activity.SubmitFeedback(ctx, vol, act.ID, model.FeedbackRequest{Score: 5, Comment: "活动很好"})
+			results <- result{feedback: feedback, err: feedbackErr}
+		}()
+	}
+	<-barrier.ready
+	<-barrier.ready
+	close(barrier.release)
+	wg.Wait()
+	close(results)
+
+	succeeded, duplicate := 0, 0
+	for result := range results {
+		switch {
+		case result.err == nil && result.feedback.ID != "":
+			succeeded++
+		case errors.Is(result.err, model.ErrAlreadyFeedback):
+			duplicate++
+		default:
+			t.Fatalf("unexpected feedback result: feedback=%+v err=%v", result.feedback, result.err)
+		}
+	}
+	stored, err := base.ListFeedbackByActivity(ctx, act.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if succeeded != 1 || duplicate != 1 || len(stored) != 1 {
+		t.Fatalf("concurrent feedback result: succeeded=%d already_feedback=%d stored=%d; want 1,1,1", succeeded, duplicate, len(stored))
 	}
 }
